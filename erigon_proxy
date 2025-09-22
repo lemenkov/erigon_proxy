@@ -75,7 +75,7 @@ class HealthMonitor:
         main_url = f"https://{self.config.reference_addr}/ogrpc?network=ethereum&dkey={self.config.server_key}"
 
         try:
-            logger.warning(f"Checking {main_url}")
+            logger.info(f"Checking {main_url}")
             async with self.session.post(main_url, json = payload) as response:
                 if response.status == 200:
                     result = await response.json()
