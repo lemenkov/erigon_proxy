@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+
+"""
+Round-Robin HTTP Proxy with Health Monitoring
+Polls backend servers every minute and routes to the healthiest one.
+"""
+
+import aiohttp
+import asyncio
+import json
+import logging
+import os
+import time
+from aiohttp import web, ClientTimeout
+from dataclasses import dataclass, field
+from typing import List, Optional
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ServerHealth:
+    url: str
+    is_healthy: bool = False
+    last_check: float = 0
+    response_time: float = float('inf')
+    consecutive_failures: int = 0
+    last_error: Optional[str] = None
+
+@dataclass
+class ProxyConfig:
+    servers: List[str] = field(default_factory=list)
+    bind_addr: str = "localhost"
+    reference_addr: str = "localhost"
+    server_key: str = "<get one please>"
+    health_check_interval: int = 60  # seconds
+    health_check_timeout: int = 5    # seconds
+    proxy_port: int = 8080
+    max_consecutive_failures: int = 3
+
+class HealthMonitor:
+    def __init__(self, config: ProxyConfig):
+        self.config = config
+        self.servers = [ServerHealth(url=url) for url in config.servers]
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.current_server_index = 0
+
+    async def start(self):
+        """Initialize the health monitor"""
+        timeout = ClientTimeout(total=self.config.health_check_timeout)
+        self.session = aiohttp.ClientSession(timeout=timeout)
+
+        # Start health checking task
+        asyncio.create_task(self.health_check_loop())
+        logger.info(f"Health monitor started for servers: {self.config.servers}")
+
+    async def stop(self):
+        """Clean up resources"""
+        if self.session:
+            await self.session.close()
+
+    async def health_check_loop(self):
+        """Continuously monitor server health"""
+        while True:
+            await self.check_all_servers()
+            await asyncio.sleep(self.config.health_check_interval)
+
+    async def check_all_servers(self):
+        """Check health of all servers concurrently"""
+        tasks = []
+
+        payload = {'jsonrpc': '2.0', 'method': 'eth_blockNumber', 'params': [], 'id':1}
+        main_url = f"https://{self.config.reference_addr}/ogrpc?network=ethereum&dkey={self.config.server_key}"
+
+        try:
+            logger.warning(f"Checking {main_url}")
+            async with self.session.post(main_url, json = payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    for server in self.servers:
+                        task = asyncio.create_task(self.check_server_health(server, payload, int(result['result'], 16)))
+                        tasks.append(task)
+
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    self.log_server_status()
+        except Exception as e:
+            pass
+
+    async def check_server_health(self, server: ServerHealth, payload: dict, current_block: int):
+        """Check health of a single server"""
+        check_url = server.url
+
+        start_time = time.time()
+
+        try:
+            async with self.session.post(check_url, json = payload) as response:
+                response_time = time.time() - start_time
+
+                if response.status == 200:
+                    result = await response.json()
+                    node_block = int(result['result'], 16)
+                    if current_block - node_block > 5:  # Allow a small lag
+                        self.mark_server_unhealthy(server, f"Node lagging (block {node_block}, current {current_block})")
+                        return
+                    server.is_healthy = True
+                    server.response_time = response_time
+                    server.consecutive_failures = 0
+                    server.last_error = None
+                    logger.debug(f"Server {server.url} is healthy (response time: {response_time:.3f}s)")
+                else:
+                    self.mark_server_unhealthy(server, f"HTTP {response.status}")
+
+        except Exception as e:
+            self.mark_server_unhealthy(server, str(e))
+
+        server.last_check = time.time()
+
+    def mark_server_unhealthy(self, server: ServerHealth, error: str):
+        """Mark server as unhealthy and track failures"""
+        server.consecutive_failures += 1
+        server.last_error = error
+        server.response_time = float('inf')
+
+        if server.consecutive_failures >= self.config.max_consecutive_failures:
+            server.is_healthy = False
+            logger.warning(f"Server {server.url} marked as unhealthy: {error}")
+
+    def get_best_server(self) -> Optional[ServerHealth]:
+        """Get the healthiest available server"""
+        healthy_servers = [s for s in self.servers if s.is_healthy]
+
+        if not healthy_servers:
+            logger.error("No healthy servers available!")
+            return None
+
+        # Sort by response time (ascending) to get the fastest healthy server
+        healthy_servers.sort(key=lambda s: s.response_time)
+        return healthy_servers[0]
+
+    def get_next_server_round_robin(self) -> Optional[ServerHealth]:
+        """Get next server using round-robin among healthy servers"""
+        healthy_servers = [s for s in self.servers if s.is_healthy]
+
+        if not healthy_servers:
+            return None
+
+        # Simple round-robin
+        server = healthy_servers[self.current_server_index % len(healthy_servers)]
+        self.current_server_index += 1
+        return server
+
+    def log_server_status(self):
+        """Log current status of all servers"""
+        healthy_count = sum(1 for s in self.servers if s.is_healthy)
+        logger.info(f"Health check complete: {healthy_count}/{len(self.servers)} servers healthy")
+
+        for server in self.servers:
+            status = "✓" if server.is_healthy else "✗"
+            rt = f"{server.response_time:.3f}s" if server.response_time != float('inf') else "N/A"
+            error_info = f" ({server.last_error})" if server.last_error else ""
+            logger.info(f"  {status} {server.url} - Response time: {rt}{error_info}")
+
+class HTTPProxy:
+    def __init__(self, config: ProxyConfig):
+        self.config = config
+        self.health_monitor = HealthMonitor(config)
+        self.client_session: Optional[aiohttp.ClientSession] = None
+
+    async def start_server(self):
+        """Start the proxy server"""
+        await self.health_monitor.start()
+
+        # Create client session for proxying requests
+        self.client_session = aiohttp.ClientSession()
+
+        app = web.Application()
+        app.router.add_route('*', '/{path:.*}', self.proxy_handler)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+
+        site = web.TCPSite(runner, self.config.bind_addr, self.config.proxy_port)
+        await site.start()
+
+        logger.info(f"Proxy server started on http://{self.config.bind_addr}:{self.config.proxy_port}")
+        return runner
+
+    async def proxy_handler(self, request: web.Request) -> web.Response:
+        """Handle incoming requests and proxy them to a healthy backend"""
+        # Get the best available server
+        target_server = self.health_monitor.get_best_server()
+
+        if not target_server:
+            return web.Response(
+                status=503,
+                text="Service Unavailable: No healthy backend servers",
+                content_type="text/plain"
+            )
+
+        # Build target URL
+        path = request.path_qs
+        target_url = f"{target_server.url.rstrip('/')}{path}"
+
+        try:
+            # Prepare headers (remove hop-by-hop headers)
+            headers = dict(request.headers)
+            hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate',
+                         'proxy-authorization', 'te', 'trailers', 'upgrade'}
+            headers = {k: v for k, v in headers.items()
+                      if k.lower() not in hop_by_hop}
+
+            # Forward the request
+            async with self.client_session.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                data=await request.read(),
+                allow_redirects=False
+            ) as response:
+
+                # Prepare response headers
+                resp_headers = dict(response.headers)
+                resp_headers = {k: v for k, v in resp_headers.items()
+                              if k.lower() not in hop_by_hop}
+
+                # Create response
+                body = await response.read()
+                return web.Response(
+                    status=response.status,
+                    headers=resp_headers,
+                    body=body
+                )
+
+        except Exception as e:
+            logger.error(f"Error proxying request to {target_url}: {e}")
+            return web.Response(
+                status=502,
+                text=f"Bad Gateway: Error connecting to backend server",
+                content_type="text/plain"
+            )
+
+    async def stop(self):
+        """Clean up resources"""
+        if self.client_session:
+            await self.client_session.close()
+        await self.health_monitor.stop()
+
+async def main():
+    # Configuration
+    instances = os.environ['INSTANCES'].split(",")
+    config = ProxyConfig(
+        servers= list(map(lambda x: f"http://{x}:8545", os.environ['INSTANCES'].split(','))),
+        bind_addr = os.environ['BIND_ADDR'],
+        reference_addr = os.environ['REFERENCE_ADDR'],
+        server_key = os.environ['SERVER_KEY'],
+        health_check_interval=60,  # Check every minute
+        health_check_timeout=5,    # 5 second timeout for health checks
+        proxy_port=8545
+    )
+
+    # Start the proxy
+    proxy = HTTPProxy(config)
+
+    try:
+        runner = await proxy.start_server()
+
+        print(f"🚀 Proxy server running on http://{config.bind_addr}:{config.proxy_port}")
+        print(f"📊 Monitoring servers: {config.servers}")
+        print(f"🔍 Health checks every {config.health_check_interval} seconds")
+        print("Press Ctrl+C to stop...")
+
+        # Keep the server running
+        while True:
+            await asyncio.sleep(1)
+
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        await proxy.stop()
+        await runner.cleanup()
+
+if __name__ == "__main__":
+    asyncio.run(main())

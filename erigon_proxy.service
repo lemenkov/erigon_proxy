@@ -1,0 +1,18 @@
+[Unit]
+Description=Erigon proxy
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/sysconfig/erigon_proxy
+ExecStart=/usr/bin/erigon_proxy
+Restart=always
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+MemoryDenyWriteExecute=yes
+DynamicUser=yes
+WorkingDirectory=/tmp
+
+[Install]
+WantedBy=multi-user.target
