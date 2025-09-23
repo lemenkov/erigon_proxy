@@ -225,13 +225,32 @@ class HTTPProxy:
                 resp_headers = {k: v for k, v in resp_headers.items()
                               if k.lower() not in hop_by_hop}
 
-                # Create response
-                body = await response.read()
-                return web.Response(
-                    status=response.status,
-                    headers=resp_headers,
-                    body=body
-                )
+                # Handle streaming response properly
+                if response.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+                    # For chunked responses, stream the content
+                    resp = web.StreamResponse(
+                        status=response.status,
+                        headers=resp_headers
+                    )
+                    await resp.prepare(request)
+
+                    async for chunk in response.content.iter_chunked(8192):
+                        await resp.write(chunk)
+
+                    await resp.write_eof()
+                    return resp
+                else:
+                    # For regular responses, read the full body
+                    body = await response.read()
+
+                    # Ensure Content-Length is set correctly
+                    resp_headers['Content-Length'] = str(len(body))
+
+                    return web.Response(
+                        status=response.status,
+                        headers=resp_headers,
+                        body=body
+                    )
 
         except Exception as e:
             logger.error(f"Error proxying request to {target_url}: {e}")
