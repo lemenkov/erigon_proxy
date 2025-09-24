@@ -222,8 +222,13 @@ class HTTPProxy:
 
                 # Prepare response headers
                 resp_headers = dict(response.headers)
+
+                # Remove hop-by-hop headers AND content-encoding headers
+                # because aiohttp automatically decompresses the body
+                headers_to_remove = hop_by_hop | {'content-encoding', 'content-length'}
+
                 resp_headers = {k: v for k, v in resp_headers.items()
-                              if k.lower() not in hop_by_hop}
+                              if k.lower() not in headers_to_remove}
 
                 # Handle streaming response properly
                 if response.headers.get('Transfer-Encoding', '').lower() == 'chunked':
