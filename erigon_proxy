@@ -39,6 +39,7 @@ class ProxyConfig:
     health_check_timeout: int = 5    # seconds
     proxy_port: int = 8080
     max_consecutive_failures: int = 3
+    max_request_size: int = 10 * 1024 * 1024  # 10MB default
 
 class HealthMonitor:
     def __init__(self, config: ProxyConfig):
@@ -175,7 +176,8 @@ class HTTPProxy:
         # Create client session for proxying requests
         self.client_session = aiohttp.ClientSession()
 
-        app = web.Application()
+        # Increase max payload size to 10MB (default is 2MB)
+        app = web.Application(client_max_size=self.config.max_request_size)
         app.router.add_route('*', '/{path:.*}', self.proxy_handler)
 
         runner = web.AppRunner(app)
