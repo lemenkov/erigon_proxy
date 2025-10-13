@@ -103,7 +103,7 @@ class HealthMonitor:
                     result = await response.json()
                     node_block = int(result['result'], 16)
                     if current_block - node_block > 5:  # Allow a small lag
-                        self.mark_server_unhealthy(server, f"Node lagging (block {node_block}, current {current_block})")
+                        self.mark_server_unhealthy(server, f"Node lagging (block {node_block}, current {current_block})", immediate=True)
                         return
                     server.is_healthy = True
                     server.response_time = response_time
@@ -118,13 +118,19 @@ class HealthMonitor:
 
         server.last_check = time.time()
 
-    def mark_server_unhealthy(self, server: ServerHealth, error: str):
-        """Mark server as unhealthy and track failures"""
+    def mark_server_unhealthy(self, server: ServerHealth, error: str, immediate: bool = False):
+        """Mark server as unhealthy and track failures
+
+        Args:
+            server: The server to mark unhealthy
+            error: Error message
+            immediate: If True, mark unhealthy immediately without waiting for threshold
+        """
         server.consecutive_failures += 1
         server.last_error = error
         server.response_time = float('inf')
 
-        if server.consecutive_failures >= self.config.max_consecutive_failures:
+        if immediate or server.consecutive_failures >= self.config.max_consecutive_failures:
             server.is_healthy = False
             logger.warning(f"Server {server.url} marked as unhealthy: {error}")
 
