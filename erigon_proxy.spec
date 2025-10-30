@@ -1,11 +1,13 @@
 Name:           erigon_proxy
-Version:        1.0.0
+Version:        1.0.1
 Release:        %autorelease
 Summary:        A simple proxy for Erigon
 License:        MIT
 URL:            https://github.com/lemenkov/erigon_proxy
 VCS:            git:%{url}.git
 Source0:        %{url}/archive/%{version}/%{name}-%{version}.tar.gz
+BuildArch:      noarch
+BuildRequires:  systemd-rpm-macros
 Requires:       python3-aiohttp
 
 %description
