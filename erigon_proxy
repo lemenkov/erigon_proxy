@@ -187,6 +187,12 @@ class HTTPProxy:
 
         # Increase max payload size to 10MB (default is 2MB)
         app = web.Application(client_max_size=self.config.max_request_size)
+
+        # Add management endpoints
+        app.router.add_get('/_proxy/health', self.health_status_handler)
+        app.router.add_post('/_proxy/loglevel', self.set_loglevel_handler)
+
+        # Main proxy route (must be last to not override management routes)
         app.router.add_route('*', '/{path:.*}', self.proxy_handler)
 
         runner = web.AppRunner(app)
@@ -197,6 +203,65 @@ class HTTPProxy:
 
         logger.info(f"Proxy server started on http://{self.config.bind_addr}:{self.config.proxy_port}")
         return runner
+
+    async def health_status_handler(self, request: web.Request) -> web.Response:
+        """Return current health status of all backend servers
+
+        Example usage:
+            curl http://localhost:8080/_proxy/health
+        """
+        servers_status = []
+        for server in self.health_monitor.servers:
+            servers_status.append({
+                "url": server.url,
+                "healthy": server.is_healthy,
+                "response_time": server.response_time if server.response_time != float('inf') else None,
+                "last_check": server.last_check,
+                "consecutive_failures": server.consecutive_failures,
+                "last_error": server.last_error
+            })
+
+        return web.json_response({
+            "servers": servers_status,
+            "healthy_count": sum(1 for s in self.health_monitor.servers if s.is_healthy),
+            "total_count": len(self.health_monitor.servers)
+        })
+
+    async def set_loglevel_handler(self, request: web.Request) -> web.Response:
+        """Dynamically change log level
+
+        Example usage:
+            curl -X POST http://localhost:8080/_proxy/loglevel -H "Content-Type: application/json" -d '{"level": "DEBUG"}'
+            curl -X POST http://localhost:8080/_proxy/loglevel -H "Content-Type: application/json" -d '{"level": "INFO", "logger": "aiohttp.access"}'
+        """
+        try:
+            data = await request.json()
+            level = data.get('level', '').upper()
+            logger_name = data.get('logger', '__main__')  # Default to main logger
+
+            # Validate level
+            valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+            if level not in valid_levels:
+                return web.json_response({
+                    "error": f"Invalid level. Must be one of: {', '.join(valid_levels)}"
+                }, status=400)
+
+            # Get the logger and set level
+            target_logger = logging.getLogger(logger_name)
+            target_logger.setLevel(getattr(logging, level))
+
+            logger.info(f"Log level for '{logger_name}' changed to {level}")
+
+            return web.json_response({
+                "success": True,
+                "logger": logger_name,
+                "level": level
+            })
+
+        except Exception as e:
+            return web.json_response({
+                "error": str(e)
+            }, status=400)
 
     async def proxy_handler(self, request: web.Request) -> web.Response:
         """Handle incoming requests and proxy them to a healthy backend"""
