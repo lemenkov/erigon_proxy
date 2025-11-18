@@ -1,5 +1,5 @@
 Name:           erigon_proxy
-Version:        1.0.1
+Version:        1.0.2
 Release:        %autorelease
 Summary:        A simple proxy for Erigon
 License:        MIT
@@ -15,9 +15,6 @@ Requires:       python3-aiohttp
 
 %prep
 %autosetup -p1
-
-%build
-# Nothing to build
 
 %install
 install -D -p -m 0755 %{name} %{buildroot}%{_bindir}/%{name}
