@@ -35,12 +35,14 @@ class ServerHealth:
 @dataclass
 class ProxyConfig:
     servers: List[str] = field(default_factory=list)
-    bind_addr: str = "localhost"
     reference_addr: str = "localhost"
     server_key: str = "<get one please>"
     health_check_interval: int = 60  # seconds
     health_check_timeout: int = 5    # seconds
+    proxy_host: str = "0.0.0.0"  # Public interface for client connections
     proxy_port: int = 8080
+    management_host: str = "127.0.0.1"  # Management interface (localhost only)
+    management_port: int = 8081
     max_consecutive_failures: int = 3
     max_request_size: int = 10 * 1024 * 1024  # 10MB default
 
@@ -179,36 +181,50 @@ class HTTPProxy:
         self.client_session: Optional[aiohttp.ClientSession] = None
 
     async def start_server(self):
-        """Start the proxy server"""
+        """Start both the proxy server and management server"""
         await self.health_monitor.start()
 
         # Create client session for proxying requests
         self.client_session = aiohttp.ClientSession()
 
         # Increase max payload size to 10MB (default is 2MB)
-        app = web.Application(client_max_size=self.config.max_request_size)
+        proxy_app = web.Application(client_max_size=self.config.max_request_size)
+        proxy_app.router.add_route('*', '/{path:.*}', self.proxy_handler)
 
-        # Add management endpoints
-        app.router.add_get('/_proxy/health', self.health_status_handler)
-        app.router.add_post('/_proxy/loglevel', self.set_loglevel_handler)
+        # Private management application (localhost only)
+        mgmt_app = web.Application()
+        mgmt_app.router.add_get('/health', self.health_status_handler)
+        mgmt_app.router.add_post('/loglevel', self.set_loglevel_handler)
 
-        # Main proxy route (must be last to not override management routes)
-        app.router.add_route('*', '/{path:.*}', self.proxy_handler)
+        # Start proxy server on public interface
+        proxy_runner = web.AppRunner(proxy_app)
+        await proxy_runner.setup()
+        proxy_site = web.TCPSite(
+            proxy_runner,
+            self.config.proxy_host,
+            self.config.proxy_port
+        )
+        await proxy_site.start()
+        logger.info(f"Proxy server started on http://{self.config.proxy_host}:{self.config.proxy_port}")
 
-        runner = web.AppRunner(app)
-        await runner.setup()
+        # Start management server on localhost only
+        mgmt_runner = web.AppRunner(mgmt_app)
+        await mgmt_runner.setup()
+        mgmt_site = web.TCPSite(
+            mgmt_runner,
+            self.config.management_host,
+            self.config.management_port
+        )
+        await mgmt_site.start()
+        logger.info(f"Management server started on http://{self.config.management_host}:{self.config.management_port}")
 
-        site = web.TCPSite(runner, self.config.bind_addr, self.config.proxy_port)
-        await site.start()
-
-        logger.info(f"Proxy server started on http://{self.config.bind_addr}:{self.config.proxy_port}")
-        return runner
+        return (proxy_runner, mgmt_runner)
 
     async def health_status_handler(self, request: web.Request) -> web.Response:
         """Return current health status of all backend servers
 
-        Example usage:
-            curl http://localhost:8080/_proxy/health
+        Example usage (management interface only):
+            curl http://localhost:8081/health
         """
         servers_status = []
         for server in self.health_monitor.servers:
@@ -230,9 +246,9 @@ class HTTPProxy:
     async def set_loglevel_handler(self, request: web.Request) -> web.Response:
         """Dynamically change log level
 
-        Example usage:
-            curl -X POST http://localhost:8080/_proxy/loglevel -H "Content-Type: application/json" -d '{"level": "DEBUG"}'
-            curl -X POST http://localhost:8080/_proxy/loglevel -H "Content-Type: application/json" -d '{"level": "INFO", "logger": "aiohttp.access"}'
+        Example usage (management interface only):
+            curl -X POST http://localhost:8081/loglevel -H "Content-Type: application/json" -d '{"level": "DEBUG"}'
+            curl -X POST http://localhost:8081/loglevel -H "Content-Type: application/json" -d '{"level": "INFO", "logger": "aiohttp.access"}'
         """
         try:
             data = await request.json()
@@ -302,7 +318,6 @@ class HTTPProxy:
                 # Remove hop-by-hop headers AND content-encoding headers
                 # because aiohttp automatically decompresses the body
                 headers_to_remove = hop_by_hop | {'content-encoding', 'content-length'}
-
                 resp_headers = {k: v for k, v in resp_headers.items()
                               if k.lower() not in headers_to_remove}
 
@@ -352,24 +367,30 @@ async def main():
     instances = os.environ['INSTANCES'].split(",")
     config = ProxyConfig(
         servers= list(map(lambda x: f"http://{x}:8545", os.environ['INSTANCES'].split(','))),
-        bind_addr = os.environ['BIND_ADDR'],
         reference_addr = os.environ['REFERENCE_ADDR'],
         server_key = os.environ['SERVER_KEY'],
         health_check_interval=60,  # Check every minute
         health_check_timeout=5,    # 5 second timeout for health checks
-        proxy_port=8545
+        proxy_host=os.environ['BIND_ADDR'],
+        proxy_port=8545,
+        management_host="127.0.0.1",  # Management API only on localhost
+        management_port=8081
     )
 
     # Start the proxy
     proxy = HTTPProxy(config)
 
     try:
-        runner = await proxy.start_server()
+        proxy_runner, mgmt_runner = await proxy.start_server()
 
-        print(f"🚀 Proxy server running on http://{config.bind_addr}:{config.proxy_port}")
+        print(f"🚀 Proxy server running on http://{config.proxy_host}:{config.proxy_port}")
+        print(f"🔧 Management API running on http://{config.management_host}:{config.management_port}")
         print(f"📊 Monitoring servers: {config.servers}")
         print(f"🔍 Health checks every {config.health_check_interval} seconds")
-        print("Press Ctrl+C to stop...")
+        print("\nManagement endpoints (localhost only):")
+        print(f"  - Health status: curl http://{config.management_host}:{config.management_port}/health")
+        print(f"  - Change log level: curl -X POST http://{config.management_host}:{config.management_port}/loglevel -H 'Content-Type: application/json' -d '{{\"level\": \"DEBUG\"}}'")
+        print("\nPress Ctrl+C to stop...")
 
         # Keep the server running
         while True:
@@ -378,7 +399,8 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Shutting down...")
         await proxy.stop()
-        await runner.cleanup()
+        await proxy_runner.cleanup()
+        await mgmt_runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
