@@ -193,6 +193,8 @@ class HTTPProxy:
         mgmt_app = web.Application()
         mgmt_app.router.add_get('/health', self.health_status_handler)
         mgmt_app.router.add_post('/loglevel', self.set_loglevel_handler)
+        mgmt_app.router.add_post('/servers/add', self.add_server_handler)
+        mgmt_app.router.add_post('/servers/remove', self.remove_server_handler)
 
         # Start proxy server on public interface
         proxy_runner = web.AppRunner(proxy_app)
@@ -270,6 +272,95 @@ class HTTPProxy:
                 "success": True,
                 "logger": logger_name,
                 "level": level
+            })
+
+        except Exception as e:
+            return web.json_response({
+                "error": str(e)
+            }, status=400)
+
+    async def add_server_handler(self, request: web.Request) -> web.Response:
+        """Add a new backend server to the pool
+
+        Example usage (management interface only):
+            curl -X POST http://localhost:8081/servers/add -H "Content-Type: application/json" -d '{"url": "http://172.31.28.136:8545"}'
+        """
+        try:
+            data = await request.json()
+            server_url = data.get('url', '').strip()
+
+            if not server_url:
+                return web.json_response({
+                    "error": "Missing 'url' parameter"
+                }, status=400)
+
+            # Check if server already exists
+            if any(s.url == server_url for s in self.health_monitor.servers):
+                return web.json_response({
+                    "error": f"Server {server_url} already exists"
+                }, status=400)
+
+            # Add new server
+            new_server = ServerHealth(url=server_url)
+            self.health_monitor.servers.append(new_server)
+
+            # Trigger immediate health check for the new server
+            asyncio.create_task(self.health_monitor.check_server_health(new_server))
+
+            logger.info(f"Added new server: {server_url}")
+
+            return web.json_response({
+                "success": True,
+                "message": f"Server {server_url} added successfully",
+                "total_servers": len(self.health_monitor.servers)
+            })
+
+        except Exception as e:
+            return web.json_response({
+                "error": str(e)
+            }, status=400)
+
+    async def remove_server_handler(self, request: web.Request) -> web.Response:
+        """Remove a backend server from the pool
+
+        Example usage (management interface only):
+            curl -X POST http://localhost:8081/servers/remove -H "Content-Type: application/json" -d '{"url": "http://172.31.28.136:8545"}'
+        """
+        try:
+            data = await request.json()
+            server_url = data.get('url', '').strip()
+
+            if not server_url:
+                return web.json_response({
+                    "error": "Missing 'url' parameter"
+                }, status=400)
+
+            # Find and remove the server
+            server_to_remove = None
+            for server in self.health_monitor.servers:
+                if server.url == server_url:
+                    server_to_remove = server
+                    break
+
+            if not server_to_remove:
+                return web.json_response({
+                    "error": f"Server {server_url} not found"
+                }, status=404)
+
+            # Check if this is the last server
+            if len(self.health_monitor.servers) == 1:
+                return web.json_response({
+                    "error": "Cannot remove the last server"
+                }, status=400)
+
+            self.health_monitor.servers.remove(server_to_remove)
+
+            logger.info(f"Removed server: {server_url}")
+
+            return web.json_response({
+                "success": True,
+                "message": f"Server {server_url} removed successfully",
+                "total_servers": len(self.health_monitor.servers)
             })
 
         except Exception as e:
