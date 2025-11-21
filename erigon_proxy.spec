@@ -1,5 +1,5 @@
 Name:           erigon_proxy
-Version:        1.0.3
+Version:        1.0.4
 Release:        %autorelease
 Summary:        A simple proxy for Erigon
 License:        MIT
