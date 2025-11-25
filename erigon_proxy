@@ -137,18 +137,6 @@ class HealthMonitor:
             server.is_healthy = False
             logger.warning(f"Server {server.url} marked as unhealthy: {error}")
 
-    def get_best_server(self) -> Optional[ServerHealth]:
-        """Get the healthiest available server"""
-        healthy_servers = [s for s in self.servers if s.is_healthy]
-
-        if not healthy_servers:
-            logger.error("No healthy servers available!")
-            return None
-
-        # Sort by response time (ascending) to get the fastest healthy server
-        healthy_servers.sort(key=lambda s: s.response_time)
-        return healthy_servers[0]
-
     def log_server_status(self):
         """Log current status of all servers"""
         healthy_count = sum(1 for s in self.servers if s.is_healthy)
@@ -358,80 +346,99 @@ class HTTPProxy:
 
     async def proxy_handler(self, request: web.Request) -> web.Response:
         """Handle incoming requests and proxy them to a healthy backend"""
-        # Get the best available server
-        target_server = self.health_monitor.get_best_server()
+        path = request.path_qs
 
-        if not target_server:
+        # Try all healthy servers in order of preference
+        healthy_servers = [s for s in self.health_monitor.servers if s.is_healthy]
+        healthy_servers.sort(key=lambda s: s.response_time)
+
+        if not healthy_servers:
             return web.Response(
                 status=503,
                 text="Service Unavailable: No healthy backend servers",
                 content_type="text/plain"
             )
 
-        # Build target URL
-        path = request.path_qs
-        target_url = f"{target_server.url.rstrip('/')}{path}"
+        last_error = None
 
-        try:
-            # Prepare headers (remove hop-by-hop headers)
-            headers = dict(request.headers)
-            hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate',
-                         'proxy-authorization', 'te', 'trailers', 'upgrade'}
-            headers = {k: v for k, v in headers.items()
-                      if k.lower() not in hop_by_hop}
+        for attempt, target_server in enumerate(healthy_servers):
+            target_url = f"{target_server.url.rstrip('/')}{path}"
 
-            # Forward the request
-            async with self.client_session.request(
-                method=request.method,
-                url=target_url,
-                headers=headers,
-                data=await request.read(),
-                allow_redirects=False
-            ) as response:
+            try:
+                # Prepare headers (remove hop-by-hop headers)
+                headers = dict(request.headers)
+                hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate',
+                             'proxy-authorization', 'te', 'trailers', 'upgrade'}
+                headers = {k: v for k, v in headers.items()
+                          if k.lower() not in hop_by_hop}
 
-                # Prepare response headers
-                resp_headers = dict(response.headers)
+                # Forward the request
+                async with self.client_session.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=headers,
+                    data=await request.read(),
+                    allow_redirects=False
+                ) as response:
 
-                # Remove hop-by-hop headers AND content-encoding headers
-                # because aiohttp automatically decompresses the body
-                headers_to_remove = hop_by_hop | {'content-encoding', 'content-length'}
-                resp_headers = {k: v for k, v in resp_headers.items()
-                              if k.lower() not in headers_to_remove}
+                    # Prepare response headers
+                    resp_headers = dict(response.headers)
 
-                # Handle streaming response properly
-                if response.headers.get('Transfer-Encoding', '').lower() == 'chunked':
-                    # For chunked responses, stream the content
-                    resp = web.StreamResponse(
-                        status=response.status,
-                        headers=resp_headers
-                    )
-                    await resp.prepare(request)
+                    # Remove hop-by-hop headers AND content-encoding headers
+                    # because aiohttp automatically decompresses the body
+                    headers_to_remove = hop_by_hop | {'content-encoding', 'content-length'}
+                    resp_headers = {k: v for k, v in resp_headers.items()
+                                  if k.lower() not in headers_to_remove}
 
-                    async for chunk in response.content.iter_chunked(8192):
-                        await resp.write(chunk)
+                    # Handle streaming response properly
+                    if response.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+                        # For chunked responses, stream the content
+                        resp = web.StreamResponse(
+                            status=response.status,
+                            headers=resp_headers
+                        )
+                        await resp.prepare(request)
 
-                    await resp.write_eof()
-                    return resp
-                else:
-                    # For regular responses, read the full body
-                    body = await response.read()
+                        async for chunk in response.content.iter_chunked(8192):
+                            await resp.write(chunk)
 
-                    # Ensure Content-Length is set correctly
-                    resp_headers['Content-Length'] = str(len(body))
+                        await resp.write_eof()
+                        return resp
+                    else:
+                        # For regular responses, read the full body
+                        body = await response.read()
 
-                    return web.Response(
-                        status=response.status,
-                        headers=resp_headers,
-                        body=body
-                    )
+                        # Ensure Content-Length is set correctly
+                        resp_headers['Content-Length'] = str(len(body))
 
-        except Exception as e:
-            logger.error(f"Error proxying request to {target_url}: {e}")
-            return web.Response(
-                status=502,
-                text=f"Bad Gateway: Error connecting to backend server",
-                content_type="text/plain"
-            )
+                        return web.Response(
+                            status=response.status,
+                            headers=resp_headers,
+                            body=body
+                        )
+
+            except Exception as e:
+                last_error = e
+                logger.error(f"Error proxying request to {target_url}: {e}")
+
+                # Mark this server as potentially unhealthy
+                self.health_monitor.mark_server_unhealthy(
+                    target_server,
+                    f"Connection error: {str(e)}"
+                )
+
+                # If this isn't the last server, continue to next one
+                if attempt < len(healthy_servers) - 1:
+                    logger.info(f"Retrying with next available server...")
+                    continue
+
+        # All servers failed
+        logger.error(f"All {len(healthy_servers)} healthy servers failed to handle request")
+        return web.Response(
+            status=502,
+            text=f"Bad Gateway: All backend servers failed. Last error: {last_error}",
+            content_type="text/plain"
+        )
 
     async def stop(self):
         """Clean up resources"""
