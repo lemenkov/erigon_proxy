@@ -149,18 +149,6 @@ class HealthMonitor:
         healthy_servers.sort(key=lambda s: s.response_time)
         return healthy_servers[0]
 
-    def get_next_server_round_robin(self) -> Optional[ServerHealth]:
-        """Get next server using round-robin among healthy servers"""
-        healthy_servers = [s for s in self.servers if s.is_healthy]
-
-        if not healthy_servers:
-            return None
-
-        # Simple round-robin
-        server = healthy_servers[self.current_server_index % len(healthy_servers)]
-        self.current_server_index += 1
-        return server
-
     def log_server_status(self):
         """Log current status of all servers"""
         healthy_count = sum(1 for s in self.servers if s.is_healthy)
