@@ -52,6 +52,7 @@ class HealthMonitor:
         self.servers = [ServerHealth(url=url) for url in config.servers]
         self.session: Optional[aiohttp.ClientSession] = None
         self.current_server_index = 0
+        self.current_block: Optional[int] = None
 
     async def start(self):
         """Initialize the health monitor"""
@@ -73,11 +74,9 @@ class HealthMonitor:
             await self.check_all_servers()
             await asyncio.sleep(self.config.health_check_interval)
 
-    async def check_all_servers(self):
-        """Check health of all servers concurrently"""
-        tasks = []
-
-        payload = {'jsonrpc': '2.0', 'method': 'eth_blockNumber', 'params': [], 'id':1}
+    async def get_reference_block(self) -> Optional[int]:
+        """Fetch current block number from reference server"""
+        payload = {'jsonrpc': '2.0', 'method': 'eth_blockNumber', 'params': [], 'id': 1}
         main_url = f"https://{self.config.reference_addr}/ogrpc?network=ethereum&dkey={self.config.server_key}"
 
         try:
@@ -85,17 +84,31 @@ class HealthMonitor:
             async with self.session.post(main_url, json = payload) as response:
                 if response.status == 200:
                     result = await response.json()
-                    for server in self.servers:
-                        task = asyncio.create_task(self.check_server_health(server, payload, int(result['result'], 16)))
-                        tasks.append(task)
-
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    self.log_server_status()
+                    return int(result['result'], 16)
         except Exception as e:
-            pass
+            logger.error(f"Failed to get reference block: {e}")
+        return None
 
-    async def check_server_health(self, server: ServerHealth, payload: dict, current_block: int):
+    async def check_all_servers(self):
+        """Check health of all servers concurrently"""
+
+        current_block = await self.get_reference_block()
+        if current_block is None:
+            return
+
+        self.current_block = current_block
+
+        tasks = []
+        for server in self.servers:
+            task = asyncio.create_task(self.check_server_health(server, current_block))
+            tasks.append(task)
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.log_server_status()
+
+    async def check_server_health(self, server: ServerHealth, current_block: int):
         """Check health of a single server"""
+        payload = {'jsonrpc': '2.0', 'method': 'eth_blockNumber', 'params': [], 'id': 1}
         start_time = time.time()
 
         try:
@@ -120,6 +133,23 @@ class HealthMonitor:
             self.mark_server_unhealthy(server, str(e))
 
         server.last_check = time.time()
+
+    async def check_single_server(self, server: ServerHealth):
+        """Check health of a single server (fetches reference block automatically)
+
+        Used for immediate health check when adding a new server.
+        """
+
+        # Use cached current_block if available, otherwise fetch it
+        current_block = self.current_block
+        if current_block is None:
+            current_block = await self.get_reference_block()
+
+        if current_block is None:
+            self.mark_server_unhealthy(server, "Could not get reference block")
+            return
+
+        await self.check_server_health(server, current_block)
 
     def mark_server_unhealthy(self, server: ServerHealth, error: str, immediate: bool = False):
         """Mark server as unhealthy and track failures
@@ -281,7 +311,7 @@ class HTTPProxy:
             self.health_monitor.servers.append(new_server)
 
             # Trigger immediate health check for the new server
-            asyncio.create_task(self.health_monitor.check_server_health(new_server))
+            asyncio.create_task(self.health_monitor.check_single_server(new_server))
 
             logger.info(f"Added new server: {server_url}")
 
