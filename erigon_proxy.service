@@ -4,14 +4,20 @@ Requires=network-online.target
 After=network-online.target
 
 [Service]
+CapabilityBoundingSet=
+DynamicUser=yes
 EnvironmentFile=-/etc/sysconfig/erigon_proxy
 ExecStart=/usr/bin/erigon_proxy
-Restart=always
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=tmpfs
+LockPersonality=yes
 MemoryDenyWriteExecute=yes
-DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=tmpfs
+ProtectSystem=strict
+Restart=always
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
 WorkingDirectory=/tmp
 
 [Install]
