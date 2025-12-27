@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: MIT
+
 Name:           erigon_proxy
 Version:        1.0.7
 Release:        %autorelease

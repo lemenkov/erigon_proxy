@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2025 Peter Lemenkov <lemenkov@gmail.com>
+# SPDX-License-Identifier: MIT
+
 [Unit]
 Description=Erigon proxy
 Requires=network-online.target
