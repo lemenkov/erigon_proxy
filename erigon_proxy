@@ -394,6 +394,13 @@ class HTTPProxy:
 
         last_error = None
 
+        data = await request.read()
+        try:
+            rpc_method = json.loads(data).get('method', 'unknown')
+            logger.debug(rpc_method)
+        except:
+            pass
+
         for attempt, target_server in enumerate(healthy_servers):
             target_url = f"{target_server.url.rstrip('/')}{path}"
 
@@ -410,7 +417,7 @@ class HTTPProxy:
                     method=request.method,
                     url=target_url,
                     headers=headers,
-                    data=await request.read(),
+                    data=data,
                     allow_redirects=False
                 ) as response:
 
