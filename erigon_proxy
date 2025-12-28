@@ -48,6 +48,7 @@ class ProxyConfig:
     management_port: int = 8081
     max_consecutive_failures: int = 3
     max_request_size: int = 10 * 1024 * 1024  # 10MB default
+    eth_getLogs_limit: int = 75  # Max concurrent eth_getLogs requests
 
 class HealthMonitor:
     def __init__(self, config: ProxyConfig):
@@ -186,6 +187,7 @@ class HTTPProxy:
         self.config = config
         self.health_monitor = HealthMonitor(config)
         self.client_session: Optional[aiohttp.ClientSession] = None
+        self.eth_getLogs_semaphore = asyncio.Semaphore(config.eth_getLogs_limit)
 
     async def start_server(self):
         """Start both the proxy server and management server"""
@@ -215,6 +217,7 @@ class HTTPProxy:
         )
         await proxy_site.start()
         logger.info(f"Proxy server started on http://{self.config.proxy_host}:{self.config.proxy_port}")
+        logger.info(f"eth_getLogs rate limit: {self.config.eth_getLogs_limit} concurrent requests")
 
         # Start management server on localhost only
         mgmt_runner = web.AppRunner(mgmt_app)
@@ -249,7 +252,8 @@ class HTTPProxy:
         return web.json_response({
             "servers": servers_status,
             "healthy_count": sum(1 for s in self.health_monitor.servers if s.is_healthy),
-            "total_count": len(self.health_monitor.servers)
+            "total_count": len(self.health_monitor.servers),
+            "eth_getLogs_limit": self.config.eth_getLogs_limit
         })
 
     async def set_loglevel_handler(self, request: web.Request) -> web.Response:
@@ -377,6 +381,73 @@ class HTTPProxy:
                 "error": str(e)
             }, status=400)
 
+    async def _forward_request(
+        self,
+        request: web.Request,
+        target_server: ServerHealth,
+        target_url: str,
+        headers: dict,
+        data: bytes
+    ) -> Optional[web.Response]:
+        """Forward a request to a target server. Returns response or None on failure."""
+        try:
+            async with self.client_session.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                data=data,
+                allow_redirects=False
+            ) as response:
+
+                # Prepare response headers
+                resp_headers = dict(response.headers)
+
+                # Remove hop-by-hop headers AND content-encoding headers
+                # because aiohttp automatically decompresses the body
+                hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate',
+                             'proxy-authorization', 'te', 'trailers', 'upgrade'}
+                headers_to_remove = hop_by_hop | {'content-encoding', 'content-length'}
+                resp_headers = {k: v for k, v in resp_headers.items()
+                              if k.lower() not in headers_to_remove}
+
+                # Handle streaming response properly
+                if response.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+                    # For chunked responses, stream the content
+                    resp = web.StreamResponse(
+                        status=response.status,
+                        headers=resp_headers
+                    )
+                    await resp.prepare(request)
+
+                    async for chunk in response.content.iter_chunked(8192):
+                        await resp.write(chunk)
+
+                    await resp.write_eof()
+                    return resp
+                else:
+                    # For regular responses, read the full body
+                    body = await response.read()
+
+                    # Ensure Content-Length is set correctly
+                    resp_headers['Content-Length'] = str(len(body))
+
+                    return web.Response(
+                        status=response.status,
+                        headers=resp_headers,
+                        body=body
+                    )
+
+        except Exception as e:
+            logger.error(f"Error proxying request to {target_url}: {e}")
+
+            # Mark this server as potentially unhealthy
+            self.health_monitor.mark_server_unhealthy(
+                target_server,
+                f"Connection error: {str(e)}"
+            )
+
+            return None
+
     async def proxy_handler(self, request: web.Request) -> web.Response:
         """Handle incoming requests and proxy them to a healthy backend"""
         path = request.path_qs
@@ -392,85 +463,51 @@ class HTTPProxy:
                 content_type="text/plain"
             )
 
-        last_error = None
-
         data = await request.read()
+        rpc_method = 'unknown'
         try:
             rpc_method = json.loads(data).get('method', 'unknown')
             logger.debug(rpc_method)
         except:
             pass
 
+        # Prepare headers (remove hop-by-hop headers)
+        hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate',
+                     'proxy-authorization', 'te', 'trailers', 'upgrade'}
+        headers = {k: v for k, v in request.headers.items()
+                  if k.lower() not in hop_by_hop}
+
+        # Rate limit eth_getLogs to prevent disk I/O saturation
+        if rpc_method == 'eth_getLogs':
+            async with self.eth_getLogs_semaphore:
+                return await self._try_servers(request, healthy_servers, path, headers, data)
+        else:
+            return await self._try_servers(request, healthy_servers, path, headers, data)
+
+    async def _try_servers(
+        self,
+        request: web.Request,
+        healthy_servers: List[ServerHealth],
+        path: str,
+        headers: dict,
+        data: bytes
+    ) -> web.Response:
+        """Try forwarding to each healthy server until one succeeds."""
+        last_error = None
+
         for attempt, target_server in enumerate(healthy_servers):
             target_url = f"{target_server.url.rstrip('/')}{path}"
 
-            try:
-                # Prepare headers (remove hop-by-hop headers)
-                headers = dict(request.headers)
-                hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate',
-                             'proxy-authorization', 'te', 'trailers', 'upgrade'}
-                headers = {k: v for k, v in headers.items()
-                          if k.lower() not in hop_by_hop}
+            result = await self._forward_request(request, target_server, target_url, headers, data)
+            if result is not None:
+                return result
 
-                # Forward the request
-                async with self.client_session.request(
-                    method=request.method,
-                    url=target_url,
-                    headers=headers,
-                    data=data,
-                    allow_redirects=False
-                ) as response:
+            last_error = f"Failed to connect to {target_server.url}"
 
-                    # Prepare response headers
-                    resp_headers = dict(response.headers)
-
-                    # Remove hop-by-hop headers AND content-encoding headers
-                    # because aiohttp automatically decompresses the body
-                    headers_to_remove = hop_by_hop | {'content-encoding', 'content-length'}
-                    resp_headers = {k: v for k, v in resp_headers.items()
-                                  if k.lower() not in headers_to_remove}
-
-                    # Handle streaming response properly
-                    if response.headers.get('Transfer-Encoding', '').lower() == 'chunked':
-                        # For chunked responses, stream the content
-                        resp = web.StreamResponse(
-                            status=response.status,
-                            headers=resp_headers
-                        )
-                        await resp.prepare(request)
-
-                        async for chunk in response.content.iter_chunked(8192):
-                            await resp.write(chunk)
-
-                        await resp.write_eof()
-                        return resp
-                    else:
-                        # For regular responses, read the full body
-                        body = await response.read()
-
-                        # Ensure Content-Length is set correctly
-                        resp_headers['Content-Length'] = str(len(body))
-
-                        return web.Response(
-                            status=response.status,
-                            headers=resp_headers,
-                            body=body
-                        )
-
-            except Exception as e:
-                last_error = e
-                logger.error(f"Error proxying request to {target_url}: {e}")
-
-                # Mark this server as potentially unhealthy
-                self.health_monitor.mark_server_unhealthy(
-                    target_server,
-                    f"Connection error: {str(e)}"
-                )
-
-                # If this isn't the last server, continue to next one
-                if attempt < len(healthy_servers) - 1:
-                    logger.info(f"Retrying with next available server...")
-                    continue
+            # If this isn't the last server, continue to next one
+            if attempt < len(healthy_servers) - 1:
+                logger.info(f"Retrying with next available server...")
+                continue
 
         # All servers failed
         logger.error(f"All {len(healthy_servers)} healthy servers failed to handle request")
@@ -498,7 +535,8 @@ async def main():
         proxy_host=os.environ['BIND_ADDR'],
         proxy_port=8545,
         management_host="127.0.0.1",  # Management API only on localhost
-        management_port=8081
+        management_port=8081,
+        eth_getLogs_limit=int(os.environ.get('ETH_GETLOGS_LIMIT', '75'))
     )
 
     # Start the proxy
@@ -511,6 +549,7 @@ async def main():
         print(f"🔧 Management API running on http://{config.management_host}:{config.management_port}")
         print(f"📊 Monitoring servers: {config.servers}")
         print(f"🔍 Health checks every {config.health_check_interval} seconds")
+        print(f"🚦 eth_getLogs rate limit: {config.eth_getLogs_limit} concurrent requests")
         print("\nManagement endpoints (localhost only):")
         print(f"  - Health status: curl http://{config.management_host}:{config.management_port}/health")
         print(f"  - Change log level: curl -X POST http://{config.management_host}:{config.management_port}/loglevel -H 'Content-Type: application/json' -d '{{\"level\": \"DEBUG\"}}'")
