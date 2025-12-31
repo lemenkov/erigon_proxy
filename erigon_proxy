@@ -24,16 +24,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Reduce aiohttp access log verbosity
-logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+
 
 @dataclass
 class ServerHealth:
     url: str
     is_healthy: bool = False
     last_check: float = 0
-    response_time: float = float('inf')
+    response_time: float = float("inf")
     consecutive_failures: int = 0
     last_error: Optional[str] = None
+
 
 @dataclass
 class ProxyConfig:
@@ -41,7 +43,7 @@ class ProxyConfig:
     reference_addr: str = "localhost"
     server_key: str = "<get one please>"
     health_check_interval: int = 60  # seconds
-    health_check_timeout: int = 5    # seconds
+    health_check_timeout: int = 5  # seconds
     proxy_host: str = "0.0.0.0"  # Public interface for client connections
     proxy_port: int = 8080
     management_host: str = "127.0.0.1"  # Management interface (localhost only)
@@ -49,6 +51,7 @@ class ProxyConfig:
     max_consecutive_failures: int = 3
     max_request_size: int = 10 * 1024 * 1024  # 10MB default
     eth_getLogs_limit: int = 75  # Max concurrent eth_getLogs requests
+
 
 class HealthMonitor:
     def __init__(self, config: ProxyConfig):
@@ -80,15 +83,15 @@ class HealthMonitor:
 
     async def get_reference_block(self) -> Optional[int]:
         """Fetch current block number from reference server"""
-        payload = {'jsonrpc': '2.0', 'method': 'eth_blockNumber', 'params': [], 'id': 1}
+        payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
         main_url = f"https://{self.config.reference_addr}/ogrpc?network=ethereum&dkey={self.config.server_key}"
 
         try:
             logger.info(f"Checking {main_url}")
-            async with self.session.post(main_url, json = payload) as response:
+            async with self.session.post(main_url, json=payload) as response:
                 if response.status == 200:
                     result = await response.json()
-                    return int(result['result'], 16)
+                    return int(result["result"], 16)
         except Exception as e:
             logger.error(f"Failed to get reference block: {e}")
         return None
@@ -112,24 +115,30 @@ class HealthMonitor:
 
     async def check_server_health(self, server: ServerHealth, current_block: int):
         """Check health of a single server"""
-        payload = {'jsonrpc': '2.0', 'method': 'eth_blockNumber', 'params': [], 'id': 1}
+        payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
         start_time = time.time()
 
         try:
-            async with self.session.post(server.url, json = payload) as response:
+            async with self.session.post(server.url, json=payload) as response:
                 response_time = time.time() - start_time
 
                 if response.status == 200:
                     result = await response.json()
-                    node_block = int(result['result'], 16)
+                    node_block = int(result["result"], 16)
                     if current_block - node_block > 5:  # Allow a small lag
-                        self.mark_server_unhealthy(server, f"Node lagging (block {node_block}, current {current_block})", immediate=True)
+                        self.mark_server_unhealthy(
+                            server,
+                            f"Node lagging (block {node_block}, current {current_block})",
+                            immediate=True,
+                        )
                         return
                     server.is_healthy = True
                     server.response_time = response_time
                     server.consecutive_failures = 0
                     server.last_error = None
-                    logger.debug(f"Server {server.url} is healthy (response time: {response_time:.3f}s)")
+                    logger.debug(
+                        f"Server {server.url} is healthy (response time: {response_time:.3f}s)"
+                    )
                 else:
                     self.mark_server_unhealthy(server, f"HTTP {response.status}")
 
@@ -155,7 +164,9 @@ class HealthMonitor:
 
         await self.check_server_health(server, current_block)
 
-    def mark_server_unhealthy(self, server: ServerHealth, error: str, immediate: bool = False):
+    def mark_server_unhealthy(
+        self, server: ServerHealth, error: str, immediate: bool = False
+    ):
         """Mark server as unhealthy and track failures
 
         Args:
@@ -165,22 +176,32 @@ class HealthMonitor:
         """
         server.consecutive_failures += 1
         server.last_error = error
-        server.response_time = float('inf')
+        server.response_time = float("inf")
 
-        if immediate or server.consecutive_failures >= self.config.max_consecutive_failures:
+        if (
+            immediate
+            or server.consecutive_failures >= self.config.max_consecutive_failures
+        ):
             server.is_healthy = False
             logger.warning(f"Server {server.url} marked as unhealthy: {error}")
 
     def log_server_status(self):
         """Log current status of all servers"""
         healthy_count = sum(1 for s in self.servers if s.is_healthy)
-        logger.info(f"Health check complete: {healthy_count}/{len(self.servers)} servers healthy")
+        logger.info(
+            f"Health check complete: {healthy_count}/{len(self.servers)} servers healthy"
+        )
 
         for server in self.servers:
             status = "✓" if server.is_healthy else "✗"
-            rt = f"{server.response_time:.3f}s" if server.response_time != float('inf') else "N/A"
+            rt = (
+                f"{server.response_time:.3f}s"
+                if server.response_time != float("inf")
+                else "N/A"
+            )
             error_info = f" ({server.last_error})" if server.last_error else ""
             logger.info(f"  {status} {server.url} - Response time: {rt}{error_info}")
+
 
 class HTTPProxy:
     def __init__(self, config: ProxyConfig):
@@ -198,37 +219,39 @@ class HTTPProxy:
 
         # Increase max payload size to 10MB (default is 2MB)
         proxy_app = web.Application(client_max_size=self.config.max_request_size)
-        proxy_app.router.add_route('*', '/{path:.*}', self.proxy_handler)
+        proxy_app.router.add_route("*", "/{path:.*}", self.proxy_handler)
 
         # Private management application (localhost only)
         mgmt_app = web.Application()
-        mgmt_app.router.add_get('/health', self.health_status_handler)
-        mgmt_app.router.add_post('/loglevel', self.set_loglevel_handler)
-        mgmt_app.router.add_post('/servers/add', self.add_server_handler)
-        mgmt_app.router.add_post('/servers/remove', self.remove_server_handler)
+        mgmt_app.router.add_get("/health", self.health_status_handler)
+        mgmt_app.router.add_post("/loglevel", self.set_loglevel_handler)
+        mgmt_app.router.add_post("/servers/add", self.add_server_handler)
+        mgmt_app.router.add_post("/servers/remove", self.remove_server_handler)
 
         # Start proxy server on public interface
         proxy_runner = web.AppRunner(proxy_app)
         await proxy_runner.setup()
         proxy_site = web.TCPSite(
-            proxy_runner,
-            self.config.proxy_host,
-            self.config.proxy_port
+            proxy_runner, self.config.proxy_host, self.config.proxy_port
         )
         await proxy_site.start()
-        logger.info(f"Proxy server started on http://{self.config.proxy_host}:{self.config.proxy_port}")
-        logger.info(f"eth_getLogs rate limit: {self.config.eth_getLogs_limit} concurrent requests")
+        logger.info(
+            f"Proxy server started on http://{self.config.proxy_host}:{self.config.proxy_port}"
+        )
+        logger.info(
+            f"eth_getLogs rate limit: {self.config.eth_getLogs_limit} concurrent requests"
+        )
 
         # Start management server on localhost only
         mgmt_runner = web.AppRunner(mgmt_app)
         await mgmt_runner.setup()
         mgmt_site = web.TCPSite(
-            mgmt_runner,
-            self.config.management_host,
-            self.config.management_port
+            mgmt_runner, self.config.management_host, self.config.management_port
         )
         await mgmt_site.start()
-        logger.info(f"Management server started on http://{self.config.management_host}:{self.config.management_port}")
+        logger.info(
+            f"Management server started on http://{self.config.management_host}:{self.config.management_port}"
+        )
 
         return (proxy_runner, mgmt_runner)
 
@@ -240,21 +263,31 @@ class HTTPProxy:
         """
         servers_status = []
         for server in self.health_monitor.servers:
-            servers_status.append({
-                "url": server.url,
-                "healthy": server.is_healthy,
-                "response_time": server.response_time if server.response_time != float('inf') else None,
-                "last_check": server.last_check,
-                "consecutive_failures": server.consecutive_failures,
-                "last_error": server.last_error
-            })
+            servers_status.append(
+                {
+                    "url": server.url,
+                    "healthy": server.is_healthy,
+                    "response_time": (
+                        server.response_time
+                        if server.response_time != float("inf")
+                        else None
+                    ),
+                    "last_check": server.last_check,
+                    "consecutive_failures": server.consecutive_failures,
+                    "last_error": server.last_error,
+                }
+            )
 
-        return web.json_response({
-            "servers": servers_status,
-            "healthy_count": sum(1 for s in self.health_monitor.servers if s.is_healthy),
-            "total_count": len(self.health_monitor.servers),
-            "eth_getLogs_limit": self.config.eth_getLogs_limit
-        })
+        return web.json_response(
+            {
+                "servers": servers_status,
+                "healthy_count": sum(
+                    1 for s in self.health_monitor.servers if s.is_healthy
+                ),
+                "total_count": len(self.health_monitor.servers),
+                "eth_getLogs_limit": self.config.eth_getLogs_limit,
+            }
+        )
 
     async def set_loglevel_handler(self, request: web.Request) -> web.Response:
         """Dynamically change log level
@@ -265,15 +298,18 @@ class HTTPProxy:
         """
         try:
             data = await request.json()
-            level = data.get('level', '').upper()
-            logger_name = data.get('logger', '__main__')  # Default to main logger
+            level = data.get("level", "").upper()
+            logger_name = data.get("logger", "__main__")  # Default to main logger
 
             # Validate level
-            valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
+            valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
             if level not in valid_levels:
-                return web.json_response({
-                    "error": f"Invalid level. Must be one of: {', '.join(valid_levels)}"
-                }, status=400)
+                return web.json_response(
+                    {
+                        "error": f"Invalid level. Must be one of: {', '.join(valid_levels)}"
+                    },
+                    status=400,
+                )
 
             # Get the logger and set level
             target_logger = logging.getLogger(logger_name)
@@ -281,16 +317,12 @@ class HTTPProxy:
 
             logger.info(f"Log level for '{logger_name}' changed to {level}")
 
-            return web.json_response({
-                "success": True,
-                "logger": logger_name,
-                "level": level
-            })
+            return web.json_response(
+                {"success": True, "logger": logger_name, "level": level}
+            )
 
         except Exception as e:
-            return web.json_response({
-                "error": str(e)
-            }, status=400)
+            return web.json_response({"error": str(e)}, status=400)
 
     async def add_server_handler(self, request: web.Request) -> web.Response:
         """Add a new backend server to the pool
@@ -300,18 +332,18 @@ class HTTPProxy:
         """
         try:
             data = await request.json()
-            server_url = data.get('url', '').strip()
+            server_url = data.get("url", "").strip()
 
             if not server_url:
-                return web.json_response({
-                    "error": "Missing 'url' parameter"
-                }, status=400)
+                return web.json_response(
+                    {"error": "Missing 'url' parameter"}, status=400
+                )
 
             # Check if server already exists
             if any(s.url == server_url for s in self.health_monitor.servers):
-                return web.json_response({
-                    "error": f"Server {server_url} already exists"
-                }, status=400)
+                return web.json_response(
+                    {"error": f"Server {server_url} already exists"}, status=400
+                )
 
             # Add new server
             new_server = ServerHealth(url=server_url)
@@ -322,16 +354,16 @@ class HTTPProxy:
 
             logger.info(f"Added new server: {server_url}")
 
-            return web.json_response({
-                "success": True,
-                "message": f"Server {server_url} added successfully",
-                "total_servers": len(self.health_monitor.servers)
-            })
+            return web.json_response(
+                {
+                    "success": True,
+                    "message": f"Server {server_url} added successfully",
+                    "total_servers": len(self.health_monitor.servers),
+                }
+            )
 
         except Exception as e:
-            return web.json_response({
-                "error": str(e)
-            }, status=400)
+            return web.json_response({"error": str(e)}, status=400)
 
     async def remove_server_handler(self, request: web.Request) -> web.Response:
         """Remove a backend server from the pool
@@ -341,12 +373,12 @@ class HTTPProxy:
         """
         try:
             data = await request.json()
-            server_url = data.get('url', '').strip()
+            server_url = data.get("url", "").strip()
 
             if not server_url:
-                return web.json_response({
-                    "error": "Missing 'url' parameter"
-                }, status=400)
+                return web.json_response(
+                    {"error": "Missing 'url' parameter"}, status=400
+                )
 
             # Find and remove the server
             server_to_remove = None
@@ -356,30 +388,30 @@ class HTTPProxy:
                     break
 
             if not server_to_remove:
-                return web.json_response({
-                    "error": f"Server {server_url} not found"
-                }, status=404)
+                return web.json_response(
+                    {"error": f"Server {server_url} not found"}, status=404
+                )
 
             # Check if this is the last server
             if len(self.health_monitor.servers) == 1:
-                return web.json_response({
-                    "error": "Cannot remove the last server"
-                }, status=400)
+                return web.json_response(
+                    {"error": "Cannot remove the last server"}, status=400
+                )
 
             self.health_monitor.servers.remove(server_to_remove)
 
             logger.info(f"Removed server: {server_url}")
 
-            return web.json_response({
-                "success": True,
-                "message": f"Server {server_url} removed successfully",
-                "total_servers": len(self.health_monitor.servers)
-            })
+            return web.json_response(
+                {
+                    "success": True,
+                    "message": f"Server {server_url} removed successfully",
+                    "total_servers": len(self.health_monitor.servers),
+                }
+            )
 
         except Exception as e:
-            return web.json_response({
-                "error": str(e)
-            }, status=400)
+            return web.json_response({"error": str(e)}, status=400)
 
     async def _forward_request(
         self,
@@ -387,7 +419,7 @@ class HTTPProxy:
         target_server: ServerHealth,
         target_url: str,
         headers: dict,
-        data: bytes
+        data: bytes,
     ) -> Optional[web.Response]:
         """Forward a request to a target server. Returns response or None on failure."""
         try:
@@ -396,7 +428,7 @@ class HTTPProxy:
                 url=target_url,
                 headers=headers,
                 data=data,
-                allow_redirects=False
+                allow_redirects=False,
             ) as response:
 
                 # Prepare response headers
@@ -404,18 +436,27 @@ class HTTPProxy:
 
                 # Remove hop-by-hop headers AND content-encoding headers
                 # because aiohttp automatically decompresses the body
-                hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate',
-                             'proxy-authorization', 'te', 'trailers', 'upgrade'}
-                headers_to_remove = hop_by_hop | {'content-encoding', 'content-length'}
-                resp_headers = {k: v for k, v in resp_headers.items()
-                              if k.lower() not in headers_to_remove}
+                hop_by_hop = {
+                    "connection",
+                    "keep-alive",
+                    "proxy-authenticate",
+                    "proxy-authorization",
+                    "te",
+                    "trailers",
+                    "upgrade",
+                }
+                headers_to_remove = hop_by_hop | {"content-encoding", "content-length"}
+                resp_headers = {
+                    k: v
+                    for k, v in resp_headers.items()
+                    if k.lower() not in headers_to_remove
+                }
 
                 # Handle streaming response properly
-                if response.headers.get('Transfer-Encoding', '').lower() == 'chunked':
+                if response.headers.get("Transfer-Encoding", "").lower() == "chunked":
                     # For chunked responses, stream the content
                     resp = web.StreamResponse(
-                        status=response.status,
-                        headers=resp_headers
+                        status=response.status, headers=resp_headers
                     )
                     await resp.prepare(request)
 
@@ -429,12 +470,10 @@ class HTTPProxy:
                     body = await response.read()
 
                     # Ensure Content-Length is set correctly
-                    resp_headers['Content-Length'] = str(len(body))
+                    resp_headers["Content-Length"] = str(len(body))
 
                     return web.Response(
-                        status=response.status,
-                        headers=resp_headers,
-                        body=body
+                        status=response.status, headers=resp_headers, body=body
                     )
 
         except Exception as e:
@@ -442,8 +481,7 @@ class HTTPProxy:
 
             # Mark this server as potentially unhealthy
             self.health_monitor.mark_server_unhealthy(
-                target_server,
-                f"Connection error: {str(e)}"
+                target_server, f"Connection error: {str(e)}"
             )
 
             return None
@@ -460,29 +498,41 @@ class HTTPProxy:
             return web.Response(
                 status=503,
                 text="Service Unavailable: No healthy backend servers",
-                content_type="text/plain"
+                content_type="text/plain",
             )
 
         data = await request.read()
-        rpc_method = 'unknown'
+        rpc_method = "unknown"
         try:
-            rpc_method = json.loads(data).get('method', 'unknown')
+            rpc_method = json.loads(data).get("method", "unknown")
             logger.debug(rpc_method)
         except:
             pass
 
         # Prepare headers (remove hop-by-hop headers)
-        hop_by_hop = {'connection', 'keep-alive', 'proxy-authenticate',
-                     'proxy-authorization', 'te', 'trailers', 'upgrade'}
-        headers = {k: v for k, v in request.headers.items()
-                  if k.lower() not in hop_by_hop}
+        hop_by_hop = {
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailers",
+            "upgrade",
+        }
+        headers = {
+            k: v for k, v in request.headers.items() if k.lower() not in hop_by_hop
+        }
 
         # Rate limit eth_getLogs to prevent disk I/O saturation
-        if rpc_method == 'eth_getLogs':
+        if rpc_method == "eth_getLogs":
             async with self.eth_getLogs_semaphore:
-                return await self._try_servers(request, healthy_servers, path, headers, data)
+                return await self._try_servers(
+                    request, healthy_servers, path, headers, data
+                )
         else:
-            return await self._try_servers(request, healthy_servers, path, headers, data)
+            return await self._try_servers(
+                request, healthy_servers, path, headers, data
+            )
 
     async def _try_servers(
         self,
@@ -490,7 +540,7 @@ class HTTPProxy:
         healthy_servers: List[ServerHealth],
         path: str,
         headers: dict,
-        data: bytes
+        data: bytes,
     ) -> web.Response:
         """Try forwarding to each healthy server until one succeeds."""
         last_error = None
@@ -498,7 +548,9 @@ class HTTPProxy:
         for attempt, target_server in enumerate(healthy_servers):
             target_url = f"{target_server.url.rstrip('/')}{path}"
 
-            result = await self._forward_request(request, target_server, target_url, headers, data)
+            result = await self._forward_request(
+                request, target_server, target_url, headers, data
+            )
             if result is not None:
                 return result
 
@@ -510,11 +562,13 @@ class HTTPProxy:
                 continue
 
         # All servers failed
-        logger.error(f"All {len(healthy_servers)} healthy servers failed to handle request")
+        logger.error(
+            f"All {len(healthy_servers)} healthy servers failed to handle request"
+        )
         return web.Response(
             status=502,
             text=f"Bad Gateway: All backend servers failed. Last error: {last_error}",
-            content_type="text/plain"
+            content_type="text/plain",
         )
 
     async def stop(self):
@@ -523,20 +577,23 @@ class HTTPProxy:
             await self.client_session.close()
         await self.health_monitor.stop()
 
+
 async def main():
     # Configuration
-    instances = os.environ['INSTANCES'].split(",")
+    instances = os.environ["INSTANCES"].split(",")
     config = ProxyConfig(
-        servers= list(map(lambda x: f"http://{x}:8545", os.environ['INSTANCES'].split(','))),
-        reference_addr = os.environ['REFERENCE_ADDR'],
-        server_key = os.environ['SERVER_KEY'],
+        servers=list(
+            map(lambda x: f"http://{x}:8545", os.environ["INSTANCES"].split(","))
+        ),
+        reference_addr=os.environ["REFERENCE_ADDR"],
+        server_key=os.environ["SERVER_KEY"],
         health_check_interval=60,  # Check every minute
-        health_check_timeout=5,    # 5 second timeout for health checks
-        proxy_host=os.environ['BIND_ADDR'],
+        health_check_timeout=5,  # 5 second timeout for health checks
+        proxy_host=os.environ["BIND_ADDR"],
         proxy_port=8545,
         management_host="127.0.0.1",  # Management API only on localhost
         management_port=8081,
-        eth_getLogs_limit=int(os.environ.get('ETH_GETLOGS_LIMIT', '75'))
+        eth_getLogs_limit=int(os.environ.get("ETH_GETLOGS_LIMIT", "75")),
     )
 
     # Start the proxy
@@ -545,14 +602,24 @@ async def main():
     try:
         proxy_runner, mgmt_runner = await proxy.start_server()
 
-        print(f"🚀 Proxy server running on http://{config.proxy_host}:{config.proxy_port}")
-        print(f"🔧 Management API running on http://{config.management_host}:{config.management_port}")
+        print(
+            f"🚀 Proxy server running on http://{config.proxy_host}:{config.proxy_port}"
+        )
+        print(
+            f"🔧 Management API running on http://{config.management_host}:{config.management_port}"
+        )
         print(f"📊 Monitoring servers: {config.servers}")
         print(f"🔍 Health checks every {config.health_check_interval} seconds")
-        print(f"🚦 eth_getLogs rate limit: {config.eth_getLogs_limit} concurrent requests")
+        print(
+            f"🚦 eth_getLogs rate limit: {config.eth_getLogs_limit} concurrent requests"
+        )
         print("\nManagement endpoints (localhost only):")
-        print(f"  - Health status: curl http://{config.management_host}:{config.management_port}/health")
-        print(f"  - Change log level: curl -X POST http://{config.management_host}:{config.management_port}/loglevel -H 'Content-Type: application/json' -d '{{\"level\": \"DEBUG\"}}'")
+        print(
+            f"  - Health status: curl http://{config.management_host}:{config.management_port}/health"
+        )
+        print(
+            f"  - Change log level: curl -X POST http://{config.management_host}:{config.management_port}/loglevel -H 'Content-Type: application/json' -d '{{\"level\": \"DEBUG\"}}'"
+        )
         print("\nPress Ctrl+C to stop...")
 
         # Keep the server running
@@ -564,6 +631,7 @@ async def main():
         await proxy.stop()
         await proxy_runner.cleanup()
         await mgmt_runner.cleanup()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
