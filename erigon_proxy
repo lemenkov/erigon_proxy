@@ -502,9 +502,12 @@ class HTTPProxy:
             )
 
         data = await request.read()
-        rpc_method = "unknown"
+        rpc_method = None
+        rpc_params = None
         try:
-            rpc_method = json.loads(data).get("method", "unknown")
+            parsed = json.loads(data)
+            rpc_method = parsed.get("method")
+            rpc_params = parsed.get("params", [])
             logger.debug(rpc_method)
         except:
             pass
@@ -527,11 +530,11 @@ class HTTPProxy:
         if rpc_method == "eth_getLogs":
             async with self.eth_getLogs_semaphore:
                 return await self._try_servers(
-                    request, healthy_servers, path, headers, data
+                    request, healthy_servers, path, headers, data, rpc_method, rpc_params
                 )
         else:
             return await self._try_servers(
-                request, healthy_servers, path, headers, data
+                request, healthy_servers, path, headers, data, rpc_method, rpc_params
             )
 
     async def _try_servers(
@@ -541,6 +544,8 @@ class HTTPProxy:
         path: str,
         headers: dict,
         data: bytes,
+        rpc_method: Optional[str] = None,
+        rpc_params: Optional[List] = None,
     ) -> web.Response:
         """Try forwarding to each healthy server until one succeeds."""
         last_error = None
@@ -552,6 +557,24 @@ class HTTPProxy:
                 request, target_server, target_url, headers, data
             )
             if result is not None:
+                # Log eth_getLogs response size for analysis
+                if rpc_method == "eth_getLogs" and hasattr(result, 'body') and result.body:
+                    try:
+                        filter_obj = rpc_params[0] if rpc_params else {}
+                        from_block = filter_obj.get('fromBlock', '?')
+                        to_block = filter_obj.get('toBlock', '?')
+                        address = filter_obj.get('address', '?')
+                        # Truncate address for logging
+                        if isinstance(address, str) and len(address) > 12:
+                            address = address[:12] + '...'
+                        elif isinstance(address, list):
+                            address = f"[{len(address)} addrs]"
+                        logger.info(
+                            f"eth_getLogs: {len(result.body)} bytes, "
+                            f"from={from_block} to={to_block} addr={address}"
+                        )
+                    except Exception as e:
+                        logger.info(f"eth_getLogs: {len(result.body)} bytes (parse error: {e})")
                 return result
 
             last_error = f"Failed to connect to {target_server.url}"
