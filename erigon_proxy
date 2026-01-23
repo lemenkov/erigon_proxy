@@ -569,19 +569,19 @@ class HTTPProxy:
                             address = address[:12] + '...'
                         elif isinstance(address, list):
                             address = f"[{len(address)} addrs]"
-                        logger.info(
+                        logger.debug(
                             f"eth_getLogs: {len(result.body)} bytes, "
                             f"from={from_block} to={to_block} addr={address}"
                         )
                     except Exception as e:
-                        logger.info(f"eth_getLogs: {len(result.body)} bytes (parse error: {e})")
+                        logger.warning(f"eth_getLogs: {len(result.body)} bytes (parse error: {e})")
                 return result
 
             last_error = f"Failed to connect to {target_server.url}"
 
             # If this isn't the last server, continue to next one
             if attempt < len(healthy_servers) - 1:
-                logger.info(f"Retrying with next available server...")
+                logger.warning(f"Retrying with next available server...")
                 continue
 
         # All servers failed
