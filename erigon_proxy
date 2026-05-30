@@ -35,6 +35,7 @@ class ServerHealth:
     response_time: float = float("inf")
     consecutive_failures: int = 0
     last_error: Optional[str] = None
+    client_version: Optional[str] = None
 
 
 @dataclass
@@ -96,6 +97,19 @@ class HealthMonitor:
             logger.error(f"Failed to get reference block: {e}")
         return None
 
+    async def fetch_client_version(self, server: ServerHealth):
+        """Fetch web3_clientVersion from a server"""
+        payload = {"jsonrpc": "2.0", "method": "web3_clientVersion", "params": [], "id": 1}
+
+        try:
+            async with self.session.post(server.url, json=payload) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    server.client_version = result.get("result")
+                    logger.info(f"Server {server.url} version: {server.client_version}")
+        except Exception as e:
+            logger.warning(f"Failed to get client version from {server.url}: {e}")
+
     async def check_all_servers(self):
         """Check health of all servers concurrently"""
 
@@ -117,6 +131,7 @@ class HealthMonitor:
         """Check health of a single server"""
         payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
         start_time = time.time()
+        was_healthy = server.is_healthy
 
         try:
             async with self.session.post(server.url, json=payload) as response:
@@ -136,6 +151,11 @@ class HealthMonitor:
                     server.response_time = response_time
                     server.consecutive_failures = 0
                     server.last_error = None
+
+                    # Fetch version on first healthy check or re-join
+                    if not was_healthy or server.client_version is None:
+                        await self.fetch_client_version(server)
+
                     logger.debug(
                         f"Server {server.url} is healthy (response time: {response_time:.3f}s)"
                     )
@@ -182,8 +202,9 @@ class HealthMonitor:
             immediate
             or server.consecutive_failures >= self.config.max_consecutive_failures
         ):
+            if server.is_healthy:
+                logger.warning(f"Server {server.url} marked as unhealthy: {error}")
             server.is_healthy = False
-            logger.warning(f"Server {server.url} marked as unhealthy: {error}")
 
     def log_server_status(self):
         """Log current status of all servers"""
@@ -199,8 +220,9 @@ class HealthMonitor:
                 if server.response_time != float("inf")
                 else "N/A"
             )
+            version = f" [{server.client_version}]" if server.client_version else ""
             error_info = f" ({server.last_error})" if server.last_error else ""
-            logger.info(f"  {status} {server.url} - Response time: {rt}{error_info}")
+            logger.info(f"  {status} {server.url}{version} - Response time: {rt}{error_info}")
 
 
 class HTTPProxy:
@@ -275,6 +297,7 @@ class HTTPProxy:
                     "last_check": server.last_check,
                     "consecutive_failures": server.consecutive_failures,
                     "last_error": server.last_error,
+                    "client_version": server.client_version,
                 }
             )
 
