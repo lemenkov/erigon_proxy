@@ -13,11 +13,11 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from aiohttp import web, ClientTimeout
 from dataclasses import dataclass, field
 from typing import List, Optional
-from datetime import datetime
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +52,9 @@ class ProxyConfig:
     max_consecutive_failures: int = 3
     max_request_size: int = 10 * 1024 * 1024  # 10MB default
     eth_getLogs_limit: int = 75  # Max concurrent eth_getLogs requests
+    drain_delay: int = (
+        40  # seconds to keep serving after SIGTERM while the LB drains us
+    )
 
 
 class HealthMonitor:
@@ -99,7 +102,12 @@ class HealthMonitor:
 
     async def fetch_client_version(self, server: ServerHealth):
         """Fetch web3_clientVersion from a server"""
-        payload = {"jsonrpc": "2.0", "method": "web3_clientVersion", "params": [], "id": 1}
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "web3_clientVersion",
+            "params": [],
+            "id": 1,
+        }
 
         try:
             async with self.session.post(server.url, json=payload) as response:
@@ -222,7 +230,9 @@ class HealthMonitor:
             )
             version = f" [{server.client_version}]" if server.client_version else ""
             error_info = f" ({server.last_error})" if server.last_error else ""
-            logger.info(f"  {status} {server.url}{version} - Response time: {rt}{error_info}")
+            logger.info(
+                f"  {status} {server.url}{version} - Response time: {rt}{error_info}"
+            )
 
 
 class HTTPProxy:
@@ -231,16 +241,20 @@ class HTTPProxy:
         self.health_monitor = HealthMonitor(config)
         self.client_session: Optional[aiohttp.ClientSession] = None
         self.eth_getLogs_semaphore = asyncio.Semaphore(config.eth_getLogs_limit)
+        self.draining = False
+        self._shutdown_event: Optional[asyncio.Event] = None
 
     async def start_server(self):
         """Start both the proxy server and management server"""
         await self.health_monitor.start()
+        self._shutdown_event = asyncio.Event()
 
         # Create client session for proxying requests
         self.client_session = aiohttp.ClientSession()
 
         # Increase max payload size to 10MB (default is 2MB)
         proxy_app = web.Application(client_max_size=self.config.max_request_size)
+        proxy_app.router.add_get("/_health", self.lb_health_handler)
         proxy_app.router.add_route("*", "/{path:.*}", self.proxy_handler)
 
         # Private management application (localhost only)
@@ -276,6 +290,43 @@ class HTTPProxy:
         )
 
         return (proxy_runner, mgmt_runner)
+
+    async def lb_health_handler(self, request: web.Request) -> web.Response:
+        """Liveness/readiness probe for the load balancer.
+
+        Returns 503 while draining, or when no backend is healthy; 200 otherwise.
+        Read-only: exposes only a count, safe to serve on the public port.
+        """
+        if self.draining:
+            return web.json_response(
+                {
+                    "status": "draining",
+                    "healthy_backends": 0,
+                    "total_backends": len(self.health_monitor.servers),
+                },
+                status=503,
+            )
+        healthy_count = sum(1 for s in self.health_monitor.servers if s.is_healthy)
+        return web.json_response(
+            {
+                "healthy_backends": healthy_count,
+                "total_backends": len(self.health_monitor.servers),
+            },
+            status=200 if healthy_count > 0 else 503,
+        )
+
+    async def _drain_and_shutdown(self):
+        """Flip the probe to 503, keep serving for drain_delay, then signal exit."""
+        if self.draining:
+            return
+        self.draining = True
+        logger.info(
+            f"Shutdown signal received: /_health now reports 503. "
+            f"Serving for {self.config.drain_delay}s while the load balancer stops routing..."
+        )
+        await asyncio.sleep(self.config.drain_delay)
+        logger.info("Drain window elapsed; finishing in-flight requests and exiting.")
+        self._shutdown_event.set()
 
     async def health_status_handler(self, request: web.Request) -> web.Response:
         """Return current health status of all backend servers
@@ -453,7 +504,6 @@ class HTTPProxy:
                 data=data,
                 allow_redirects=False,
             ) as response:
-
                 # Prepare response headers
                 resp_headers = dict(response.headers)
 
@@ -532,7 +582,7 @@ class HTTPProxy:
             rpc_method = parsed.get("method")
             rpc_params = parsed.get("params", [])
             logger.debug(rpc_method)
-        except:
+        except (json.JSONDecodeError, AttributeError):
             pass
 
         # Prepare headers (remove hop-by-hop headers)
@@ -553,7 +603,13 @@ class HTTPProxy:
         if rpc_method == "eth_getLogs":
             async with self.eth_getLogs_semaphore:
                 return await self._try_servers(
-                    request, healthy_servers, path, headers, data, rpc_method, rpc_params
+                    request,
+                    healthy_servers,
+                    path,
+                    headers,
+                    data,
+                    rpc_method,
+                    rpc_params,
                 )
         else:
             return await self._try_servers(
@@ -581,15 +637,19 @@ class HTTPProxy:
             )
             if result is not None:
                 # Log eth_getLogs response size for analysis
-                if rpc_method == "eth_getLogs" and hasattr(result, 'body') and result.body:
+                if (
+                    rpc_method == "eth_getLogs"
+                    and hasattr(result, "body")
+                    and result.body
+                ):
                     try:
                         filter_obj = rpc_params[0] if rpc_params else {}
-                        from_block = filter_obj.get('fromBlock', '?')
-                        to_block = filter_obj.get('toBlock', '?')
-                        address = filter_obj.get('address', '?')
+                        from_block = filter_obj.get("fromBlock", "?")
+                        to_block = filter_obj.get("toBlock", "?")
+                        address = filter_obj.get("address", "?")
                         # Truncate address for logging
                         if isinstance(address, str) and len(address) > 12:
-                            address = address[:12] + '...'
+                            address = address[:12] + "..."
                         elif isinstance(address, list):
                             address = f"[{len(address)} addrs]"
                         logger.debug(
@@ -597,14 +657,16 @@ class HTTPProxy:
                             f"from={from_block} to={to_block} addr={address}"
                         )
                     except Exception as e:
-                        logger.warning(f"eth_getLogs: {len(result.body)} bytes (parse error: {e})")
+                        logger.warning(
+                            f"eth_getLogs: {len(result.body)} bytes (parse error: {e})"
+                        )
                 return result
 
             last_error = f"Failed to connect to {target_server.url}"
 
             # If this isn't the last server, continue to next one
             if attempt < len(healthy_servers) - 1:
-                logger.warning(f"Retrying with next available server...")
+                logger.warning("Retrying with next available server...")
                 continue
 
         # All servers failed
@@ -626,7 +688,6 @@ class HTTPProxy:
 
 async def main():
     # Configuration
-    instances = os.environ["INSTANCES"].split(",")
     config = ProxyConfig(
         servers=list(
             map(lambda x: f"http://{x}:8545", os.environ["INSTANCES"].split(","))
@@ -640,43 +701,51 @@ async def main():
         management_host="127.0.0.1",  # Management API only on localhost
         management_port=8081,
         eth_getLogs_limit=int(os.environ.get("ETH_GETLOGS_LIMIT", "75")),
+        drain_delay=int(os.environ.get("SHUTDOWN_DRAIN_SECONDS", "40")),
     )
 
     # Start the proxy
     proxy = HTTPProxy(config)
 
-    try:
-        proxy_runner, mgmt_runner = await proxy.start_server()
+    proxy_runner, mgmt_runner = await proxy.start_server()
 
-        print(
-            f"🚀 Proxy server running on http://{config.proxy_host}:{config.proxy_port}"
-        )
-        print(
-            f"🔧 Management API running on http://{config.management_host}:{config.management_port}"
-        )
-        print(f"📊 Monitoring servers: {config.servers}")
-        print(f"🔍 Health checks every {config.health_check_interval} seconds")
-        print(
-            f"🚦 eth_getLogs rate limit: {config.eth_getLogs_limit} concurrent requests"
-        )
-        print("\nManagement endpoints (localhost only):")
-        print(
-            f"  - Health status: curl http://{config.management_host}:{config.management_port}/health"
-        )
-        print(
-            f"  - Change log level: curl -X POST http://{config.management_host}:{config.management_port}/loglevel -H 'Content-Type: application/json' -d '{{\"level\": \"DEBUG\"}}'"
-        )
-        print("\nPress Ctrl+C to stop...")
+    loop = asyncio.get_running_loop()
 
-        # Keep the server running
-        while True:
-            await asyncio.sleep(1)
+    def _on_sigterm():
+        # systemd stop / RPM restart: full graceful drain
+        asyncio.create_task(proxy._drain_and_shutdown())
 
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        await proxy.stop()
-        await proxy_runner.cleanup()
-        await mgmt_runner.cleanup()
+    def _on_sigint():
+        # interactive Ctrl+C: skip the drain wait, exit promptly
+        proxy.draining = True
+        proxy._shutdown_event.set()
+
+    loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+    loop.add_signal_handler(signal.SIGINT, _on_sigint)
+
+    print(f"🚀 Proxy server running on http://{config.proxy_host}:{config.proxy_port}")
+    print(
+        f"🔧 Management API running on http://{config.management_host}:{config.management_port}"
+    )
+    print(f"📊 Monitoring servers: {config.servers}")
+    print(f"🔍 Health checks every {config.health_check_interval} seconds")
+    print(f"🚦 eth_getLogs rate limit: {config.eth_getLogs_limit} concurrent requests")
+    print("\nManagement endpoints (localhost only):")
+    print(
+        f"  - Health status: curl http://{config.management_host}:{config.management_port}/health"
+    )
+    print(
+        f"  - Change log level: curl -X POST http://{config.management_host}:{config.management_port}/loglevel -H 'Content-Type: application/json' -d '{{\"level\": \"DEBUG\"}}'"
+    )
+    print("\nPress Ctrl+C to stop...")
+
+    await proxy._shutdown_event.wait()
+
+    logger.info("Stopping listeners and draining in-flight requests...")
+    await proxy_runner.cleanup()  # refuse new conns, let in-flight handlers finish
+    await proxy.stop()  # close upstream session + health loop
+    await mgmt_runner.cleanup()
+    logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
