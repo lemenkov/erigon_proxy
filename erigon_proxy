@@ -496,6 +496,10 @@ class HTTPProxy:
         data: bytes,
     ) -> Optional[web.Response]:
         """Forward a request to a target server. Returns response or None on failure."""
+        # Don't forward the client's Host header — backends (Erigon) enforce an
+        # http.vhosts allowlist and reject unknown hosts (e.g. the NLB DNS name).
+        # Dropping it lets aiohttp set Host from target_url per-backend.
+        headers = {k: v for k, v in headers.items() if k.lower() != "host"}
         try:
             async with self.client_session.request(
                 method=request.method,
