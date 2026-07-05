@@ -5,7 +5,20 @@
 #
 """
 Round-Robin HTTP Proxy with Health Monitoring
-Polls backend servers every minute and routes to the healthiest one.
+
+Health strategy:
+  - Fast internal sweep (every ~1s, free): polls every backend for its block
+    height and derives the chain tip as max(node_blocks). A node is served only
+    while it is at the fleet tip; lagging nodes are evicted.
+  - Temporal grace: a node exactly 1 block behind is tolerated briefly (block
+    propagation is not instantaneous across sites); a node >=2 behind, or stuck
+    1 behind past the grace, is evicted immediately.
+  - Hysteresis: an evicted node rejoins only after sitting at the tip for a
+    sustained period, so a flapping node does not bounce back into rotation.
+  - External anchor (every ~45s, fixed rate): one call to the reference provider
+    (drpc) purely to detect the case where the WHOLE fleet lags the real tip
+    (reorg/upstream blip). This keeps the rate-limited external call off the hot
+    path so the internal sweep can run as fast as we like.
 """
 
 import aiohttp
@@ -36,6 +49,9 @@ class ServerHealth:
     consecutive_failures: int = 0
     last_error: Optional[str] = None
     client_version: Optional[str] = None
+    block: Optional[int] = None  # last observed block height (None if unreachable)
+    lag_since: Optional[float] = None  # when the node first fell behind fleet tip
+    healthy_since: Optional[float] = None  # when the node started sitting at tip
 
 
 @dataclass
@@ -43,8 +59,16 @@ class ProxyConfig:
     servers: List[str] = field(default_factory=list)
     reference_addr: str = "localhost"
     server_key: str = "<get one please>"
-    health_check_interval: int = 60  # seconds
-    health_check_timeout: int = 5  # seconds
+    # Fast internal sweep against our own nodes (free, poll as fast as we like).
+    health_check_interval: float = 1.0  # seconds
+    health_check_timeout: int = 2  # seconds (per node / per reference call)
+    # Slow external anchor against the rate-limited reference provider.
+    reference_check_interval: int = 45  # seconds
+    # Lag policy, all measured against fleet-max (the tip observed across nodes).
+    max_lag_immediate: int = 2  # >= this many blocks behind -> evict immediately
+    lag_grace_seconds: float = 2.0  # tolerate being 1 block behind this long
+    readmit_seconds: float = 3.0  # must sit at tip this long before rejoining
+    max_fleet_lag: int = 2  # fleet-max this far behind external tip -> whole-fleet lag
     proxy_host: str = "0.0.0.0"  # Public interface for client connections
     proxy_port: int = 8080
     management_host: str = "127.0.0.1"  # Management interface (localhost only)
@@ -63,16 +87,27 @@ class HealthMonitor:
         self.servers = [ServerHealth(url=url) for url in config.servers]
         self.session: Optional[aiohttp.ClientSession] = None
         self.current_server_index = 0
-        self.current_block: Optional[int] = None
+        self.current_block: Optional[int] = None  # latest fleet-max (chain tip)
+        self.external_tip: Optional[int] = None  # latest reference-provider block
+        self.fleet_lagging: bool = False  # whole fleet is behind the external tip
+        self._last_healthy_count: int = -1
 
     async def start(self):
         """Initialize the health monitor"""
         timeout = ClientTimeout(total=self.config.health_check_timeout)
         self.session = aiohttp.ClientSession(timeout=timeout)
 
-        # Start health checking task
+        # Seed the external anchor once so the whole-fleet-lag guard works early.
+        self.external_tip = await self.get_reference_block()
+
+        # Start the fast internal sweep and the slow external anchor.
         asyncio.create_task(self.health_check_loop())
-        logger.info(f"Health monitor started for servers: {self.config.servers}")
+        asyncio.create_task(self.reference_check_loop())
+        logger.info(
+            f"Health monitor started for {len(self.servers)} servers "
+            f"(sweep every {self.config.health_check_interval}s, "
+            f"external anchor every {self.config.reference_check_interval}s)"
+        )
 
     async def stop(self):
         """Clean up resources"""
@@ -80,24 +115,37 @@ class HealthMonitor:
             await self.session.close()
 
     async def health_check_loop(self):
-        """Continuously monitor server health"""
+        """Fast internal sweep: derive tip from our own nodes, evict laggards."""
         while True:
-            await self.check_all_servers()
+            try:
+                await self.check_all_servers()
+            except Exception as e:
+                logger.error(f"Health sweep error: {e}")
             await asyncio.sleep(self.config.health_check_interval)
 
+    async def reference_check_loop(self):
+        """Slow external anchor: fixed low rate, independent of sweep frequency."""
+        while True:
+            await asyncio.sleep(self.config.reference_check_interval)
+            tip = await self.get_reference_block()
+            if tip is not None:
+                self.external_tip = tip
+
     async def get_reference_block(self) -> Optional[int]:
-        """Fetch current block number from reference server"""
+        """Fetch current block number from the external reference provider."""
         payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
         main_url = f"https://{self.config.reference_addr}/ogrpc?network=ethereum&dkey={self.config.server_key}"
 
         try:
-            logger.info(f"Checking {main_url}")
+            logger.debug(
+                f"Fetching external reference block from {self.config.reference_addr}"
+            )
             async with self.session.post(main_url, json=payload) as response:
                 if response.status == 200:
                     result = await response.json()
                     return int(result["result"], 16)
         except Exception as e:
-            logger.error(f"Failed to get reference block: {e}")
+            logger.warning(f"Failed to get external reference block: {e}")
         return None
 
     async def fetch_client_version(self, server: ServerHealth):
@@ -118,121 +166,173 @@ class HealthMonitor:
         except Exception as e:
             logger.warning(f"Failed to get client version from {server.url}: {e}")
 
-    async def check_all_servers(self):
-        """Check health of all servers concurrently"""
+    async def poll_block(self, server: ServerHealth) -> Optional[int]:
+        """Query a single node's block height. Returns the block or None on failure.
 
-        current_block = await self.get_reference_block()
-        if current_block is None:
-            return
-
-        self.current_block = current_block
-
-        tasks = []
-        for server in self.servers:
-            task = asyncio.create_task(self.check_server_health(server, current_block))
-            tasks.append(task)
-
-        await asyncio.gather(*tasks, return_exceptions=True)
-        self.log_server_status()
-
-    async def check_server_health(self, server: ServerHealth, current_block: int):
-        """Check health of a single server"""
+        This only fetches data; health decisions are made by the sweep once the
+        fleet tip is known.
+        """
         payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
         start_time = time.time()
-        was_healthy = server.is_healthy
-
         try:
             async with self.session.post(server.url, json=payload) as response:
-                response_time = time.time() - start_time
-
                 if response.status == 200:
                     result = await response.json()
-                    node_block = int(result["result"], 16)
-                    if current_block - node_block > 5:  # Allow a small lag
-                        self.mark_server_unhealthy(
-                            server,
-                            f"Node lagging (block {node_block}, current {current_block})",
-                            immediate=True,
-                        )
-                        return
-                    server.is_healthy = True
-                    server.response_time = response_time
-                    server.consecutive_failures = 0
-                    server.last_error = None
-
-                    # Fetch version on first healthy check or re-join
-                    if not was_healthy or server.client_version is None:
-                        await self.fetch_client_version(server)
-
-                    logger.debug(
-                        f"Server {server.url} is healthy (response time: {response_time:.3f}s)"
-                    )
-                else:
-                    self.mark_server_unhealthy(server, f"HTTP {response.status}")
-
+                    server.response_time = time.time() - start_time
+                    return int(result["result"], 16)
+                server.response_time = float("inf")
+                server.last_error = f"HTTP {response.status}"
+                return None
         except Exception as e:
-            self.mark_server_unhealthy(server, str(e))
+            server.response_time = float("inf")
+            server.last_error = str(e)
+            return None
 
-        server.last_check = time.time()
+    async def check_all_servers(self):
+        """One fast sweep: poll all nodes, compute the tip, apply lag policy."""
+        now = time.time()
 
-    async def check_single_server(self, server: ServerHealth):
-        """Check health of a single server (fetches reference block automatically)
-
-        Used for immediate health check when adding a new server.
-        """
-
-        # Use cached current_block if available, otherwise fetch it
-        current_block = self.current_block
-        if current_block is None:
-            current_block = await self.get_reference_block()
-
-        if current_block is None:
-            self.mark_server_unhealthy(server, "Could not get reference block")
-            return
-
-        await self.check_server_health(server, current_block)
-
-    def mark_server_unhealthy(
-        self, server: ServerHealth, error: str, immediate: bool = False
-    ):
-        """Mark server as unhealthy and track failures
-
-        Args:
-            server: The server to mark unhealthy
-            error: Error message
-            immediate: If True, mark unhealthy immediately without waiting for threshold
-        """
-        server.consecutive_failures += 1
-        server.last_error = error
-        server.response_time = float("inf")
-
-        if (
-            immediate
-            or server.consecutive_failures >= self.config.max_consecutive_failures
-        ):
-            if server.is_healthy:
-                logger.warning(f"Server {server.url} marked as unhealthy: {error}")
-            server.is_healthy = False
-
-    def log_server_status(self):
-        """Log current status of all servers"""
-        healthy_count = sum(1 for s in self.servers if s.is_healthy)
-        logger.info(
-            f"Health check complete: {healthy_count}/{len(self.servers)} servers healthy"
+        results = await asyncio.gather(
+            *[self.poll_block(s) for s in self.servers], return_exceptions=True
         )
 
+        responders = []
+        for server, blk in zip(self.servers, results):
+            server.last_check = now
+            if isinstance(blk, Exception) or blk is None:
+                server.block = None
+                self._handle_unreachable(server, now)
+            else:
+                server.block = blk
+                responders.append(server)
+
+        if not responders:
+            # Nothing to derive a tip from; all handled as unreachable above.
+            self.log_server_status()
+            return
+
+        fleet_max = max(s.block for s in responders)
+        self.current_block = fleet_max
+
+        # Whole-fleet lag guard: only meaningful when we have an external anchor.
+        self.fleet_lagging = (
+            self.external_tip is not None
+            and self.external_tip - fleet_max >= self.config.max_fleet_lag
+        )
+        if self.fleet_lagging:
+            logger.warning(
+                f"Whole fleet lagging: fleet tip {fleet_max} is "
+                f"{self.external_tip - fleet_max} behind external tip "
+                f"{self.external_tip}; still serving best-available nodes"
+            )
+
+        for server in responders:
+            self._apply_health(server, fleet_max, now)
+
+        self.log_server_status(fleet_max)
+
+    def _handle_unreachable(self, server: ServerHealth, now: float):
+        """A node failed to respond this sweep."""
+        server.consecutive_failures += 1
+        server.healthy_since = None
+        server.lag_since = None
+        if server.consecutive_failures >= self.config.max_consecutive_failures:
+            if server.is_healthy:
+                logger.warning(
+                    f"Server {server.url} marked unhealthy: {server.last_error}"
+                )
+            server.is_healthy = False
+
+    def _apply_health(self, server: ServerHealth, fleet_max: int, now: float):
+        """Decide a responding node's health from its lag against the fleet tip."""
+        server.consecutive_failures = 0
+        lag = fleet_max - server.block
+
+        if lag <= 0:
+            # At the tip.
+            server.lag_since = None
+            server.last_error = None
+            if server.is_healthy:
+                if server.healthy_since is None:
+                    server.healthy_since = now
+                return
+            # Recovering: require a sustained streak at the tip before rejoining.
+            if server.healthy_since is None:
+                server.healthy_since = now
+            if now - server.healthy_since >= self.config.readmit_seconds:
+                server.is_healthy = True
+                logger.info(
+                    f"Server {server.url} re-admitted "
+                    f"(at tip for {self.config.readmit_seconds}s, block {server.block})"
+                )
+                if server.client_version is None:
+                    asyncio.create_task(self.fetch_client_version(server))
+            return
+
+        # Behind the tip.
+        server.healthy_since = None
+
+        if lag >= self.config.max_lag_immediate:
+            if server.is_healthy:
+                logger.warning(
+                    f"Server {server.url} lagging {lag} blocks "
+                    f"(block {server.block}, tip {fleet_max}) - evicting"
+                )
+            server.is_healthy = False
+            if server.lag_since is None:
+                server.lag_since = now
+            server.last_error = f"Lagging {lag} blocks (block {server.block}, tip {fleet_max})"
+            return
+
+        # Exactly 1 behind: could be propagation. Tolerate briefly, then evict.
+        if server.lag_since is None:
+            server.lag_since = now
+        if server.is_healthy and now - server.lag_since >= self.config.lag_grace_seconds:
+            logger.warning(
+                f"Server {server.url} stuck 1 block behind for "
+                f">{self.config.lag_grace_seconds}s (block {server.block}, "
+                f"tip {fleet_max}) - evicting"
+            )
+            server.is_healthy = False
+            server.last_error = f"Stuck 1 block behind (block {server.block}, tip {fleet_max})"
+
+    async def check_single_server(self, server: ServerHealth):
+        """Immediate health check for a newly added server."""
+        now = time.time()
+        server.last_check = now
+        blk = await self.poll_block(server)
+        if blk is None:
+            server.block = None
+            self._handle_unreachable(server, now)
+            return
+        server.block = blk
+        ref = self.current_block if self.current_block is not None else blk
+        self._apply_health(server, max(ref, blk), now)
+
+    def log_server_status(self, fleet_max: Optional[int] = None):
+        """Log fleet status. INFO on healthy-count change, DEBUG otherwise."""
+        healthy_count = sum(1 for s in self.servers if s.is_healthy)
+        changed = healthy_count != self._last_healthy_count
+        self._last_healthy_count = healthy_count
+        level = logging.INFO if changed else logging.DEBUG
+
+        tip = fleet_max if fleet_max is not None else self.current_block
+        logger.log(
+            level,
+            f"Health: {healthy_count}/{len(self.servers)} healthy, tip {tip}"
+            + (" [FLEET LAGGING]" if self.fleet_lagging else ""),
+        )
         for server in self.servers:
             status = "✓" if server.is_healthy else "✗"
-            rt = (
-                f"{server.response_time:.3f}s"
-                if server.response_time != float("inf")
-                else "N/A"
-            )
-            version = f" [{server.client_version}]" if server.client_version else ""
+            if server.block is None:
+                blk = "N/A"
+            elif tip is not None:
+                lag = tip - server.block
+                blk = f"{server.block} (-{lag})" if lag > 0 else str(server.block)
+            else:
+                blk = str(server.block)
             error_info = f" ({server.last_error})" if server.last_error else ""
-            logger.info(
-                f"  {status} {server.url}{version} - Response time: {rt}{error_info}"
-            )
+            logger.log(level, f"  {status} {server.url} block={blk}{error_info}")
 
 
 class HTTPProxy:
@@ -340,6 +440,7 @@ class HTTPProxy:
                 {
                     "url": server.url,
                     "healthy": server.is_healthy,
+                    "block": server.block,
                     "response_time": (
                         server.response_time
                         if server.response_time != float("inf")
@@ -359,6 +460,9 @@ class HTTPProxy:
                     1 for s in self.health_monitor.servers if s.is_healthy
                 ),
                 "total_count": len(self.health_monitor.servers),
+                "fleet_tip": self.health_monitor.current_block,
+                "external_tip": self.health_monitor.external_tip,
+                "fleet_lagging": self.health_monitor.fleet_lagging,
                 "eth_getLogs_limit": self.config.eth_getLogs_limit,
             }
         )
@@ -557,9 +661,7 @@ class HTTPProxy:
             logger.error(f"Error proxying request to {target_url}: {e}")
 
             # Mark this server as potentially unhealthy
-            self.health_monitor.mark_server_unhealthy(
-                target_server, f"Connection error: {str(e)}"
-            )
+            self.health_monitor._handle_unreachable(target_server, time.time())
 
             return None
 
@@ -567,9 +669,9 @@ class HTTPProxy:
         """Handle incoming requests and proxy them to a healthy backend"""
         path = request.path_qs
 
-        # Try all healthy servers in order of preference
+        # Try all healthy servers, freshest block first, then fastest.
         healthy_servers = [s for s in self.health_monitor.servers if s.is_healthy]
-        healthy_servers.sort(key=lambda s: s.response_time)
+        healthy_servers.sort(key=lambda s: (-(s.block or 0), s.response_time))
 
         if not healthy_servers:
             return web.Response(
@@ -698,8 +800,13 @@ async def main():
         ),
         reference_addr=os.environ["REFERENCE_ADDR"],
         server_key=os.environ["SERVER_KEY"],
-        health_check_interval=60,  # Check every minute
-        health_check_timeout=5,  # 5 second timeout for health checks
+        health_check_interval=float(os.environ.get("HEALTH_CHECK_INTERVAL", "1")),
+        health_check_timeout=int(os.environ.get("HEALTH_CHECK_TIMEOUT", "2")),
+        reference_check_interval=int(os.environ.get("REFERENCE_CHECK_INTERVAL", "45")),
+        max_lag_immediate=int(os.environ.get("MAX_LAG_IMMEDIATE", "2")),
+        lag_grace_seconds=float(os.environ.get("LAG_GRACE_SECONDS", "2")),
+        readmit_seconds=float(os.environ.get("READMIT_SECONDS", "3")),
+        max_fleet_lag=int(os.environ.get("MAX_FLEET_LAG", "2")),
         proxy_host=os.environ["BIND_ADDR"],
         proxy_port=8545,
         management_host="127.0.0.1",  # Management API only on localhost
@@ -732,7 +839,10 @@ async def main():
         f"🔧 Management API running on http://{config.management_host}:{config.management_port}"
     )
     print(f"📊 Monitoring servers: {config.servers}")
-    print(f"🔍 Health checks every {config.health_check_interval} seconds")
+    print(
+        f"🔍 Internal sweep every {config.health_check_interval}s "
+        f"(external anchor every {config.reference_check_interval}s)"
+    )
     print(f"🚦 eth_getLogs rate limit: {config.eth_getLogs_limit} concurrent requests")
     print("\nManagement endpoints (localhost only):")
     print(
