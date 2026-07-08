@@ -66,9 +66,10 @@ class ProxyConfig:
     reference_check_interval: int = 45  # seconds
     # Lag policy, all measured against fleet-max (the tip observed across nodes).
     max_lag_immediate: int = 2  # >= this many blocks behind -> evict immediately
-    lag_grace_seconds: float = 2.0  # tolerate being 1 block behind this long
-    readmit_seconds: float = 3.0  # must sit at tip this long before rejoining
+    lag_grace_seconds: float = 6.0  # tolerate being 1 block behind this long
+    readmit_seconds: float = 2.0  # must sit at tip this long before rejoining
     max_fleet_lag: int = 2  # fleet-max this far behind external tip -> whole-fleet lag
+    min_healthy_floor: int = 1  # never soft-lag-evict below this many healthy nodes
     proxy_host: str = "0.0.0.0"  # Public interface for client connections
     proxy_port: int = 8080
     management_host: str = "127.0.0.1"  # Management interface (localhost only)
@@ -284,17 +285,29 @@ class HealthMonitor:
             server.last_error = f"Lagging {lag} blocks (block {server.block}, tip {fleet_max})"
             return
 
-        # Exactly 1 behind: could be propagation. Tolerate briefly, then evict.
+        # Exactly 1 behind: could be propagation. Tolerate briefly, then evict —
+        # but never evict on soft lag if it would drop the healthy pool to/below
+        # the floor. A barely-behind node beats an empty pool: serving 1 block
+        # stale is far better than serving nothing. (Hard lag >= max_lag_immediate
+        # is handled above and always evicts, floor or not — a frozen node must go.)
         if server.lag_since is None:
             server.lag_since = now
         if server.is_healthy and now - server.lag_since >= self.config.lag_grace_seconds:
-            logger.warning(
-                f"Server {server.url} stuck 1 block behind for "
-                f">{self.config.lag_grace_seconds}s (block {server.block}, "
-                f"tip {fleet_max}) - evicting"
-            )
-            server.is_healthy = False
-            server.last_error = f"Stuck 1 block behind (block {server.block}, tip {fleet_max})"
+            healthy_now = sum(1 for s in self.servers if s.is_healthy)
+            if healthy_now <= self.config.min_healthy_floor:
+                logger.warning(
+                    f"Server {server.url} 1 block behind (block {server.block}, "
+                    f"tip {fleet_max}) but retained: healthy pool at floor "
+                    f"({healthy_now}/{len(self.servers)})"
+                )
+            else:
+                logger.warning(
+                    f"Server {server.url} stuck 1 block behind for "
+                    f">{self.config.lag_grace_seconds}s (block {server.block}, "
+                    f"tip {fleet_max}) - evicting"
+                )
+                server.is_healthy = False
+                server.last_error = f"Stuck 1 block behind (block {server.block}, tip {fleet_max})"
 
     async def check_single_server(self, server: ServerHealth):
         """Immediate health check for a newly added server."""
@@ -804,9 +817,10 @@ async def main():
         health_check_timeout=int(os.environ.get("HEALTH_CHECK_TIMEOUT", "2")),
         reference_check_interval=int(os.environ.get("REFERENCE_CHECK_INTERVAL", "45")),
         max_lag_immediate=int(os.environ.get("MAX_LAG_IMMEDIATE", "2")),
-        lag_grace_seconds=float(os.environ.get("LAG_GRACE_SECONDS", "2")),
-        readmit_seconds=float(os.environ.get("READMIT_SECONDS", "3")),
+        lag_grace_seconds=float(os.environ.get("LAG_GRACE_SECONDS", "6")),
+        readmit_seconds=float(os.environ.get("READMIT_SECONDS", "2")),
         max_fleet_lag=int(os.environ.get("MAX_FLEET_LAG", "2")),
+        min_healthy_floor=int(os.environ.get("MIN_HEALTHY_FLOOR", "1")),
         proxy_host=os.environ["BIND_ADDR"],
         proxy_port=8545,
         management_host="127.0.0.1",  # Management API only on localhost
