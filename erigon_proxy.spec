@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 Name:           erigon_proxy
-Version:        1.2.1
+Version:        1.2.2
 Release:        %autorelease
 Summary:        A simple proxy for Erigon
 License:        MIT

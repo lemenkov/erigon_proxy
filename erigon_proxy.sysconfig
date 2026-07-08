@@ -1,18 +1,69 @@
+# /etc/sysconfig/erigon_proxy
+#
 # SPDX-FileCopyrightText: 2025 Peter Lemenkov <lemenkov@gmail.com>
 # SPDX-License-Identifier: MIT
 
-PYTHONUNBUFFERED=TRUE
-SERVER_KEY=<get one please>
-BIND_ADDR=192.168.1.1
+# ─── REQUIRED — deployment-specific, no defaults (process won't start without them)
+
+# Backend Erigon nodes, comma-separated IPs. Each becomes http://<ip>:8545.
+# (These four are the fleet from the morning log — adjust to your real backends.)
+INSTANCES=192.168.1.10,192.168.1.20
+
+# External reference provider host. The proxy calls
+#   https://<REFERENCE_ADDR>/ogrpc?network=ethereum&dkey=<SERVER_KEY>
+# once every REFERENCE_CHECK_INTERVAL s, only to detect whole-fleet lag.
 REFERENCE_ADDR=example.com
-INSTANCES=191.168.1.10,192.168.1.20
-ETH_GETLOGS_LIMIT=75
-SHUTDOWN_DRAIN_SECONDS=40
-HEALTH_CHECK_INTERVAL=1
-HEALTH_CHECK_TIMEOUT=2
-MAX_LAG_IMMEDIATE=2
-LAG_GRACE_SECONDS=6
-READMIT_SECONDS=2
+
+# Reference provider API key (drpc dkey). Secret — see file-permission note above.
+SERVER_KEY=<get one please>
+
+# Public interface the proxy listens on (port is fixed at 8545 in the code).
+# 0.0.0.0 behind an NLB/SG or VPN; pin to a specific address to be stricter.
+BIND_ADDR=0.0.0.0
+
+# ─── LAG POLICY — the health band (this is what fixes the eviction storm)
+
+# Nodes within this many blocks of the fleet tip stay HEALTHY. Absorbs the
+# normal 1–3 block per-slot import stagger between independent nodes.
+# Routing still prefers the freshest node, so this never serves stale when a
+# fresher backend is up — it just keeps slightly-behind nodes as warm failover.
+SOFT_LAG_MAX=3
+
+# >= this many blocks behind = frozen/broken: evict immediately, floor or not.
+# This is the one case the old metric got right (e.g. .6 diving to -20/-50).
+HARD_LAG_IMMEDIATE=8
+
+# A node in the soft band (SOFT_LAG_MAX < lag < HARD) must PERSIST there this
+# long before eviction. > one 12 s slot, so a single slow import doesn't trip it.
+LAG_GRACE_SECONDS=20
+
+# A recovering node rejoins after sitting WITHIN the band this long (not at exact
+# tip — exact-tip re-admit was nearly unreachable with a tip that moves every 12 s).
+READMIT_SECONDS=5
+
+# Whole-fleet-lag WARNING only: fleet tip this far behind the external reference.
+# 5 avoids spamming on the normal ~2-block propagation offset vs. drpc.
+MAX_FLEET_LAG=5
+
+# Never soft-evict below this many healthy nodes. A few-blocks-stale node beats
+# an empty pool (503). Hard lag still evicts regardless — a frozen node must go.
 MIN_HEALTHY_FLOOR=1
+
+# ─── OPERATIONAL — sweep cadence, timeouts, limits (defaults are fine)
+
+# Fast internal sweep against our own nodes. Cheap; 1 s was never the problem.
+HEALTH_CHECK_INTERVAL=1
+
+# Per-node / per-reference call timeout.
+HEALTH_CHECK_TIMEOUT=2
+
+# Slow external anchor cadence (keeps the rate-limited drpc call off the hot path).
 REFERENCE_CHECK_INTERVAL=45
-MAX_FLEET_LAG=2
+
+# Max concurrent eth_getLogs in flight — caps disk I/O amplification from heavy
+# log queries hitting the backends' MergeLoop.
+ETH_GETLOGS_LIMIT=75
+
+# On SIGTERM: keep serving this long (probe flips to 503) so the front LB stops
+# routing before we exit. Keep this LONGER than the LB's deregistration delay.
+SHUTDOWN_DRAIN_SECONDS=40

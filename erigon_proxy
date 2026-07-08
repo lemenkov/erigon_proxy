@@ -65,11 +65,17 @@ class ProxyConfig:
     # Slow external anchor against the rate-limited reference provider.
     reference_check_interval: int = 45  # seconds
     # Lag policy, all measured against fleet-max (the tip observed across nodes).
-    max_lag_immediate: int = 2  # >= this many blocks behind -> evict immediately
-    lag_grace_seconds: float = 6.0  # tolerate being 1 block behind this long
-    readmit_seconds: float = 2.0  # must sit at tip this long before rejoining
-    max_fleet_lag: int = 2  # fleet-max this far behind external tip -> whole-fleet lag
-    min_healthy_floor: int = 1  # never soft-lag-evict below this many healthy nodes
+    # A node is healthy within a *band* of the tip, not only exactly at it:
+    # independent nodes import each slot's block with a small stagger, so at 1s
+    # resolution the fleet is routinely spread across a few block numbers for a
+    # second or two around every 12s slot. The band absorbs that; only genuine,
+    # sustained lag evicts.
+    soft_lag_max: int = 3            # <= this many behind tip = still healthy (propagation band)
+    hard_lag_immediate: int = 8      # >= this many behind = frozen/broken -> evict immediately
+    lag_grace_seconds: float = 20.0  # tolerate soft lag (band < lag < hard) this long, then evict
+    readmit_seconds: float = 5.0     # must sit WITHIN the band this long before rejoining
+    max_fleet_lag: int = 5           # fleet-max this far behind external tip -> whole-fleet warning
+    min_healthy_floor: int = 1       # never soft-evict below this many healthy nodes
     proxy_host: str = "0.0.0.0"  # Public interface for client connections
     proxy_port: int = 8080
     management_host: str = "127.0.0.1"  # Management interface (localhost only)
@@ -245,35 +251,50 @@ class HealthMonitor:
             server.is_healthy = False
 
     def _apply_health(self, server: ServerHealth, fleet_max: int, now: float):
-        """Decide a responding node's health from its lag against the fleet tip."""
+        """Decide a responding node's health from its lag against the fleet tip.
+
+        Health is a *band*, not an exact-tip match:
+          - lag <= soft_lag_max        -> healthy (within propagation band)
+          - soft_lag_max < lag < hard  -> soft lag: tolerated under a time grace,
+                                          evicted only if it persists
+          - lag >= hard_lag_immediate  -> frozen/broken: evict at once
+        Re-admission is symmetric with eviction: a recovering node rejoins once
+        it sits *within the band* (not necessarily exactly at tip) for
+        readmit_seconds. Requiring exact tip made recovery nearly impossible,
+        since the tip moves every ~12s.
+        """
         server.consecutive_failures = 0
         lag = fleet_max - server.block
 
-        if lag <= 0:
-            # At the tip.
+        # ── Inside the band: close enough to serve. ──────────────────────────
+        if lag <= self.config.soft_lag_max:
             server.lag_since = None
-            server.last_error = None
+            if lag <= 0:
+                server.last_error = None
             if server.is_healthy:
                 if server.healthy_since is None:
                     server.healthy_since = now
                 return
-            # Recovering: require a sustained streak at the tip before rejoining.
+            # Recovering: require a sustained streak within the band to rejoin.
             if server.healthy_since is None:
                 server.healthy_since = now
             if now - server.healthy_since >= self.config.readmit_seconds:
                 server.is_healthy = True
                 logger.info(
                     f"Server {server.url} re-admitted "
-                    f"(at tip for {self.config.readmit_seconds}s, block {server.block})"
+                    f"(within {self.config.soft_lag_max} of tip for "
+                    f"{self.config.readmit_seconds}s, block {server.block})"
                 )
                 if server.client_version is None:
                     asyncio.create_task(self.fetch_client_version(server))
             return
 
-        # Behind the tip.
+        # ── Outside the band: not a candidate to be healthy this sweep. ───────
         server.healthy_since = None
 
-        if lag >= self.config.max_lag_immediate:
+        # Frozen / clearly broken: evict immediately, floor or not. A node this
+        # far back is not serving usefully; keeping it would poison routing.
+        if lag >= self.config.hard_lag_immediate:
             if server.is_healthy:
                 logger.warning(
                     f"Server {server.url} lagging {lag} blocks "
@@ -282,32 +303,37 @@ class HealthMonitor:
             server.is_healthy = False
             if server.lag_since is None:
                 server.lag_since = now
-            server.last_error = f"Lagging {lag} blocks (block {server.block}, tip {fleet_max})"
+            server.last_error = (
+                f"Lagging {lag} blocks (block {server.block}, tip {fleet_max})"
+            )
             return
 
-        # Exactly 1 behind: could be propagation. Tolerate briefly, then evict —
-        # but never evict on soft lag if it would drop the healthy pool to/below
-        # the floor. A barely-behind node beats an empty pool: serving 1 block
-        # stale is far better than serving nothing. (Hard lag >= max_lag_immediate
-        # is handled above and always evicts, floor or not — a frozen node must go.)
+        # Soft lag (band < lag < hard): tolerate briefly, then evict — but never
+        # soft-evict below the healthy floor. A slightly-stale node beats an
+        # empty pool: serving a few blocks stale is far better than serving 503.
         if server.lag_since is None:
             server.lag_since = now
-        if server.is_healthy and now - server.lag_since >= self.config.lag_grace_seconds:
+        if (
+            server.is_healthy
+            and now - server.lag_since >= self.config.lag_grace_seconds
+        ):
             healthy_now = sum(1 for s in self.servers if s.is_healthy)
             if healthy_now <= self.config.min_healthy_floor:
                 logger.warning(
-                    f"Server {server.url} 1 block behind (block {server.block}, "
+                    f"Server {server.url} {lag} blocks behind (block {server.block}, "
                     f"tip {fleet_max}) but retained: healthy pool at floor "
                     f"({healthy_now}/{len(self.servers)})"
                 )
             else:
                 logger.warning(
-                    f"Server {server.url} stuck 1 block behind for "
+                    f"Server {server.url} stuck {lag} blocks behind for "
                     f">{self.config.lag_grace_seconds}s (block {server.block}, "
                     f"tip {fleet_max}) - evicting"
                 )
                 server.is_healthy = False
-                server.last_error = f"Stuck 1 block behind (block {server.block}, tip {fleet_max})"
+                server.last_error = (
+                    f"Stuck {lag} blocks behind (block {server.block}, tip {fleet_max})"
+                )
 
     async def check_single_server(self, server: ServerHealth):
         """Immediate health check for a newly added server."""
@@ -816,10 +842,11 @@ async def main():
         health_check_interval=float(os.environ.get("HEALTH_CHECK_INTERVAL", "1")),
         health_check_timeout=int(os.environ.get("HEALTH_CHECK_TIMEOUT", "2")),
         reference_check_interval=int(os.environ.get("REFERENCE_CHECK_INTERVAL", "45")),
-        max_lag_immediate=int(os.environ.get("MAX_LAG_IMMEDIATE", "2")),
-        lag_grace_seconds=float(os.environ.get("LAG_GRACE_SECONDS", "6")),
-        readmit_seconds=float(os.environ.get("READMIT_SECONDS", "2")),
-        max_fleet_lag=int(os.environ.get("MAX_FLEET_LAG", "2")),
+        soft_lag_max=int(os.environ.get("SOFT_LAG_MAX", "3")),
+        hard_lag_immediate=int(os.environ.get("HARD_LAG_IMMEDIATE", "8")),
+        lag_grace_seconds=float(os.environ.get("LAG_GRACE_SECONDS", "20")),
+        readmit_seconds=float(os.environ.get("READMIT_SECONDS", "5")),
+        max_fleet_lag=int(os.environ.get("MAX_FLEET_LAG", "5")),
         min_healthy_floor=int(os.environ.get("MIN_HEALTHY_FLOOR", "1")),
         proxy_host=os.environ["BIND_ADDR"],
         proxy_port=8545,
