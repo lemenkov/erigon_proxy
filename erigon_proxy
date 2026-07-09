@@ -269,8 +269,7 @@ class HealthMonitor:
         # ── Inside the band: close enough to serve. ──────────────────────────
         if lag <= self.config.soft_lag_max:
             server.lag_since = None
-            if lag <= 0:
-                server.last_error = None
+            server.last_error = None
             if server.is_healthy:
                 if server.healthy_since is None:
                     server.healthy_since = now
