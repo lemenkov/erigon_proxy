@@ -39,6 +39,15 @@ logger = logging.getLogger(__name__)
 # Reduce aiohttp access log verbosity
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
+# AWS NLB TCP listeners have a FIXED 350s idle timeout that cannot be
+# configured (AWS platform constraint, not ours). Any long-lived socket idle
+# this long is silently reaped. WS heartbeat must stay well under it — the
+# ceiling it's validated against, deliberately NOT env-overridable so the check
+# can't be disabled by "raising the limit". If this proxy is ever fronted by
+# something other than an AWS NLB (ALB, GCP LB, HAProxy, direct), revisit this
+# one line.
+AWS_NLB_IDLE_TIMEOUT_SECONDS = 350.0
+
 
 @dataclass
 class ServerHealth:
@@ -70,12 +79,18 @@ class ProxyConfig:
     # resolution the fleet is routinely spread across a few block numbers for a
     # second or two around every 12s slot. The band absorbs that; only genuine,
     # sustained lag evicts.
-    soft_lag_max: int = 3            # <= this many behind tip = still healthy (propagation band)
-    hard_lag_immediate: int = 8      # >= this many behind = frozen/broken -> evict immediately
-    lag_grace_seconds: float = 20.0  # tolerate soft lag (band < lag < hard) this long, then evict
-    readmit_seconds: float = 5.0     # must sit WITHIN the band this long before rejoining
-    max_fleet_lag: int = 5           # fleet-max this far behind external tip -> whole-fleet warning
-    min_healthy_floor: int = 1       # never soft-evict below this many healthy nodes
+    soft_lag_max: int = 3  # <= this many behind tip = still healthy (propagation band)
+    hard_lag_immediate: int = (
+        8  # >= this many behind = frozen/broken -> evict immediately
+    )
+    lag_grace_seconds: float = (
+        20.0  # tolerate soft lag (band < lag < hard) this long, then evict
+    )
+    readmit_seconds: float = 5.0  # must sit WITHIN the band this long before rejoining
+    max_fleet_lag: int = (
+        5  # fleet-max this far behind external tip -> whole-fleet warning
+    )
+    min_healthy_floor: int = 1  # never soft-evict below this many healthy nodes
     proxy_host: str = "0.0.0.0"  # Public interface for client connections
     proxy_port: int = 8080
     management_host: str = "127.0.0.1"  # Management interface (localhost only)
@@ -86,6 +101,34 @@ class ProxyConfig:
     drain_delay: int = (
         40  # seconds to keep serving after SIGTERM while the LB drains us
     )
+    # WebSocket proxying
+    ws_heartbeat: float = (
+        30.0  # ping every N s: resets the NLB 350s idle timer AND detects dead peers. Must be < 350.
+    )
+    ws_health_poll: float = (
+        5.0  # re-check the pinned backend's health every N s; drop the client if it leaves rotation
+    )
+
+    def __post_init__(self):
+        if self.ws_heartbeat <= 0:
+            raise ValueError(f"ws_heartbeat must be positive, got {self.ws_heartbeat}")
+        if self.ws_health_poll <= 0:
+            raise ValueError(
+                f"ws_health_poll must be positive, got {self.ws_health_poll}"
+            )
+        if self.ws_heartbeat >= AWS_NLB_IDLE_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"ws_heartbeat ({self.ws_heartbeat}s) must be < the AWS NLB idle "
+                f"timeout ({AWS_NLB_IDLE_TIMEOUT_SECONDS}s): the load balancer would "
+                f"reap idle WebSocket connections. Lower WS_HEARTBEAT_SECONDS."
+            )
+        if self.ws_heartbeat > AWS_NLB_IDLE_TIMEOUT_SECONDS / 2:
+            logger.warning(
+                f"ws_heartbeat ({self.ws_heartbeat}s) exceeds half the AWS NLB idle "
+                f"timeout ({AWS_NLB_IDLE_TIMEOUT_SECONDS}s): a single delayed ping "
+                f"could let the connection idle out. Recommend "
+                f"<= {AWS_NLB_IDLE_TIMEOUT_SECONDS / 2}s."
+            )
 
 
 class HealthMonitor:
@@ -705,6 +748,11 @@ class HTTPProxy:
 
     async def proxy_handler(self, request: web.Request) -> web.Response:
         """Handle incoming requests and proxy them to a healthy backend"""
+
+        # WebSocket upgrade: hand off to the WS relay before any body read.
+        if request.headers.get("Upgrade", "").lower() == "websocket":
+            return await self._handle_websocket(request)
+
         path = request.path_qs
 
         # Try all healthy servers, freshest block first, then fastest.
@@ -759,6 +807,105 @@ class HTTPProxy:
             return await self._try_servers(
                 request, healthy_servers, path, headers, data, rpc_method, rpc_params
             )
+
+    async def _handle_websocket(self, request: web.Request) -> web.StreamResponse:
+        """Proxy a WebSocket to a healthy backend.
+
+        WS is a stateful, long-lived pin to ONE backend (unlike stateless
+        per-request HTTP routing). Pick the freshest healthy node at connect,
+        relay frames both ways, and drop the client if that backend later
+        leaves rotation, so a subscription never silently streams from a
+        lagging/evicted node. The client is expected to reconnect.
+        """
+        if self.draining:
+            return web.Response(status=503, text="Draining", content_type="text/plain")
+
+        healthy = [s for s in self.health_monitor.servers if s.is_healthy]
+        healthy.sort(key=lambda s: (-(s.block or 0), s.response_time))
+        if not healthy:
+            return web.Response(
+                status=503,
+                text="Service Unavailable: No healthy backend servers",
+                content_type="text/plain",
+            )
+        target = healthy[0]
+
+        # Erigon serves WS on the same port as HTTP-RPC (--ws), so reuse the
+        # backend host:port and just switch scheme http->ws.
+        backend_url = (
+            target.url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        ).rstrip("/") + request.path_qs
+
+        requested = request.headers.get("Sec-WebSocket-Protocol")
+        protocols = tuple(p.strip() for p in requested.split(",")) if requested else ()
+
+        client_ws = web.WebSocketResponse(
+            heartbeat=self.config.ws_heartbeat,
+            max_msg_size=self.config.max_request_size,
+            protocols=protocols,
+        )
+        await client_ws.prepare(request)
+
+        try:
+            async with self.client_session.ws_connect(
+                backend_url,
+                heartbeat=self.config.ws_heartbeat,
+                max_msg_size=self.config.max_request_size,
+                protocols=protocols,
+            ) as backend_ws:
+                logger.info(f"WS open: client ⇄ {target.url}")
+                await self._relay_ws(client_ws, backend_ws, target)
+        except Exception as e:
+            logger.warning(f"WS backend connect failed ({target.url}): {e}")
+            self.health_monitor._handle_unreachable(target, time.time())
+            if not client_ws.closed:
+                await client_ws.close(
+                    code=aiohttp.WSCloseCode.TRY_AGAIN_LATER,
+                    message=b"backend unavailable",
+                )
+
+        logger.info(f"WS close: client ⇄ {target.url}")
+        return client_ws
+
+    async def _relay_ws(self, client_ws, backend_ws, target: ServerHealth):
+        """Pump frames both ways until either side closes; drop on backend eviction."""
+
+        async def pump(src, dst):
+            async for msg in src:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    await dst.send_str(msg.data)
+                elif msg.type == aiohttp.WSMsgType.BINARY:
+                    await dst.send_bytes(msg.data)
+                else:  # ERROR / CLOSE / CLOSING / CLOSED
+                    break
+            if not dst.closed:
+                await dst.close()
+
+        async def health_watch():
+            # A WS is pinned to one backend; if that backend leaves rotation
+            # (lag/evict) or we begin draining, close so the client reconnects
+            # onto a fresh node instead of streaming stale data.
+            while not client_ws.closed and not backend_ws.closed:
+                if self.draining or not target.is_healthy:
+                    logger.info(
+                        f"WS backend {target.url} left rotation; closing client to force reconnect"
+                    )
+                    if not backend_ws.closed:
+                        await backend_ws.close()
+                    if not client_ws.closed:
+                        await client_ws.close(
+                            code=aiohttp.WSCloseCode.GOING_AWAY,
+                            message=b"backend rotated out; reconnect",
+                        )
+                    return
+                await asyncio.sleep(self.config.ws_health_poll)
+
+        await asyncio.gather(
+            pump(client_ws, backend_ws),
+            pump(backend_ws, client_ws),
+            health_watch(),
+            return_exceptions=True,
+        )
 
     async def _try_servers(
         self,
@@ -853,6 +1000,8 @@ async def main():
         management_port=8081,
         eth_getLogs_limit=int(os.environ.get("ETH_GETLOGS_LIMIT", "75")),
         drain_delay=int(os.environ.get("SHUTDOWN_DRAIN_SECONDS", "40")),
+        ws_heartbeat=float(os.environ.get("WS_HEARTBEAT_SECONDS", "30")),
+        ws_health_poll=float(os.environ.get("WS_HEALTH_POLL_SECONDS", "5")),
     )
 
     # Start the proxy

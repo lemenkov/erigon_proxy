@@ -67,3 +67,29 @@ ETH_GETLOGS_LIMIT=75
 # On SIGTERM: keep serving this long (probe flips to 503) so the front LB stops
 # routing before we exit. Keep this LONGER than the LB's deregistration delay.
 SHUTDOWN_DRAIN_SECONDS=40
+
+# ─── WEBSOCKET PROXYING (optional; sane defaults apply if unset)
+
+# The proxy relays WebSocket (eth_subscribe newHeads/logs, long-lived duplex
+# RPC) to the freshest healthy backend, pinned for the connection's life. It
+# drops the client if that backend leaves rotation, so clients MUST reconnect
+# on close. No env var enables this — WS upgrades are handled automatically.
+
+# WS heartbeat: the proxy pings each WS connection every N seconds. This is the
+# fix for "the load balancer cuts idle sockets": AWS NLB TCP listeners have a
+# FIXED 350s idle timeout, so a quiet subscription is silently reaped without a
+# heartbeat. Must stay well under 350 (the proxy refuses to start otherwise, and
+# warns if set above 175). Default 30 is comfortable. Only override to tune.
+# WS_HEARTBEAT_SECONDS=30
+
+# How often the proxy re-checks that a WS connection's pinned backend is still
+# healthy; on eviction/drain it closes the client so it reconnects onto a fresh
+# node. Default 5. Lower = faster failover off a lagging node, marginally more
+# checks. Only override if you want tighter WS failover.
+# WS_HEALTH_POLL_SECONDS=5
+
+# NOTE: the 350s ceiling is an AWS-NLB fact, hard-coded in the proxy as
+# AWS_NLB_IDLE_TIMEOUT_SECONDS — deliberately NOT settable here, so the
+# heartbeat safety check can't be disabled by "raising the limit". If this proxy
+# is ever fronted by something other than an AWS NLB, that constant (in code) is
+# what changes, not this file.
